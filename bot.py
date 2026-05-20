@@ -143,6 +143,12 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("✅ Bot is running on Render...")
 
+    # Verify environment variables
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN is missing!")
+    if not TMDB_API_KEY:
+        raise ValueError("TMDB_API_KEY is missing!")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -150,14 +156,14 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    # Start the bot and keep the process alive
+    # Start polling
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:
         import traceback
         print("❌ Startup error:")
         traceback.print_exc()
