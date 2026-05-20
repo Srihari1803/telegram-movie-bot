@@ -153,7 +153,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
     )
 
     # Start polling
@@ -167,4 +167,4 @@ if __name__ == "__main__":
         import traceback
         print("❌ Startup error:")
         traceback.print_exc()
-        raise
+                raise
