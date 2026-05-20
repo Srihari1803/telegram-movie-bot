@@ -1,10 +1,13 @@
 import json
 import os
+import sqlite3
 from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
 from ddgs import DDGS
+from rapidfuzz import fuzz
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -14,41 +17,139 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
+# ==========================================
 # Load environment variables
+# ==========================================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
+DB_FILE = "bot.db"
+BLOCKED_PATTERNS = ["magnet:", ".torrent", "btih"]
 
-# --------------------------------------------------
-# Load sites from sites.json
-# --------------------------------------------------
+
+# ==========================================
+# Database Setup
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            user_id INTEGER,
+            title TEXT,
+            category TEXT,
+            searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            user_id INTEGER,
+            title TEXT,
+            category TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# Database Functions
+# ==========================================
+def save_history(user_id, title, category):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT INTO history (user_id, title, category) VALUES (?, ?, ?)",
+        (user_id, title, category)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_history(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT title, category, searched_at
+        FROM history
+        WHERE user_id = ?
+        ORDER BY searched_at DESC
+        LIMIT 10
+    """, (user_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def add_favorite(user_id, title, category):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    # Avoid duplicates
+    cur.execute("""
+        SELECT 1
+        FROM favorites
+        WHERE user_id = ? AND title = ? AND category = ?
+    """, (user_id, title, category))
+
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO favorites (user_id, title, category) VALUES (?, ?, ?)",
+            (user_id, title, category)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_favorites(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT title, category
+        FROM favorites
+        WHERE user_id = ?
+    """, (user_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+# ==========================================
+# Utility Functions
+# ==========================================
+def is_allowed_link(url):
+    url_lower = url.lower()
+    return not any(pattern in url_lower for pattern in BLOCKED_PATTERNS)
+
+
 def load_sites():
-    try:
-        with open("sites.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if isinstance(data, list):
-            return data
-
-        if isinstance(data, dict):
-            return data.get("sites", [])
-
-    except Exception:
-        pass
-
-    return []
+    with open("sites.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-# --------------------------------------------------
-# Get movie/TV info from TMDb
-# --------------------------------------------------
-def get_tmdb_info(title: str):
+def get_sites(category):
+    data = load_sites()
+    return data.get(category, [])
+
+
+# ==========================================
+# TMDb Functions
+# ==========================================
+def get_tmdb_info(title):
     if not TMDB_API_KEY:
         return None
 
@@ -57,7 +158,7 @@ def get_tmdb_info(title: str):
         params = {
             "api_key": TMDB_API_KEY,
             "query": title,
-            "include_adult": "true",
+            "include_adult": "true"
         }
 
         response = requests.get(url, params=params, timeout=15)
@@ -72,8 +173,10 @@ def get_tmdb_info(title: str):
         return {
             "title": best.get("title") or best.get("name") or title,
             "year": (
-                (best.get("release_date") or best.get("first_air_date") or "")[:4]
-            ),
+                best.get("release_date")
+                or best.get("first_air_date")
+                or ""
+            )[:4],
             "rating": best.get("vote_average"),
             "overview": best.get("overview"),
             "poster": (
@@ -87,12 +190,14 @@ def get_tmdb_info(title: str):
         return None
 
 
-# --------------------------------------------------
-# Search one site using DuckDuckGo
-# --------------------------------------------------
-def search_site(title: str, site_url: str):
+# ==========================================
+# Search Functions
+# ==========================================
+def search_site(title, site_url):
     domain = urlparse(site_url).netloc.replace("www.", "")
     query = f'{title} site:{domain}'
+
+    matches = []
 
     try:
         with DDGS() as ddgs:
@@ -100,20 +205,33 @@ def search_site(title: str, site_url: str):
 
             for result in results:
                 href = result.get("href") or result.get("url")
-                if href and domain in href:
-                    return href
+                result_title = result.get("title", "")
+
+                if not href:
+                    continue
+
+                if not is_allowed_link(href):
+                    continue
+
+                score = fuzz.ratio(
+                    title.lower(),
+                    result_title.lower()
+                )
+
+                matches.append((score, href))
 
     except Exception:
         return None
 
-    return None
+    if not matches:
+        return None
+
+    matches.sort(reverse=True)
+    return matches[0][1]
 
 
-# --------------------------------------------------
-# Search all configured sites
-# --------------------------------------------------
-def search_movie(title: str):
-    sites = load_sites()
+def search_category(title, category):
+    sites = get_sites(category)
     found = {}
 
     for site in sites:
@@ -123,89 +241,22 @@ def search_movie(title: str):
             domain = urlparse(site).netloc.replace("www.", "")
             found[domain] = result
 
-        # Limit to 8 results
         if len(found) >= 8:
             break
 
     return found
 
 
-# --------------------------------------------------
-# /start command
-# --------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎬 Welcome to Movie Search Bot!\n\n"
-        "Send me any movie or TV show title.\n"
-        "Example: Inception"
-    )
-
-
-# --------------------------------------------------
-# /help command
-# --------------------------------------------------
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 How to use this bot:\n\n"
-        "1. Send any movie or TV show title.\n"
-        "2. The bot will search configured streaming sites.\n"
-        "3. You'll get clickable buttons with links.\n\n"
-        "Examples:\n"
-        "• Inception\n"
-        "• Breaking Bad\n"
-        "• Interstellar"
-    )
-
-
-# --------------------------------------------------
-# /sites command
-# --------------------------------------------------
-async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sites = load_sites()
-
-    if not sites:
-        await update.message.reply_text("❌ No sites configured.")
-        return
-
-    domains = []
-    for site in sites:
-        domains.append(urlparse(site).netloc.replace("www.", ""))
-
-    await update.message.reply_text(
-        "🌐 Configured sites:\n\n" + "\n".join(f"• {d}" for d in domains)
-    )
-
-
-# --------------------------------------------------
-# Handle movie title searches
-# --------------------------------------------------
-async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw_title = update.message.text.strip()
-
-    status = await update.message.reply_text("🔍 Searching...")
-
-    # Get TMDb info
-    info = get_tmdb_info(raw_title)
-
-    if info:
-        title = info["title"]
-    else:
-        title = raw_title
-
-    # Search configured sites
-    results = search_movie(title)
-
-    if not results:
-        await status.edit_text(
-            f'❌ "{raw_title}" was not found on any configured sites.'
-        )
-        return
-
-    # Build caption
+# ==========================================
+# Message Formatting
+# ==========================================
+def build_caption(info, title):
     if info:
         caption = f"🎬 <b>{info['title']}"
+
         if info["year"]:
             caption += f" ({info['year']})"
+
         caption += "</b>\n"
 
         if info["rating"]:
@@ -215,22 +266,48 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
             overview = info["overview"]
             if len(overview) > 400:
                 overview = overview[:400] + "..."
+
             caption += f"\n{overview}\n"
     else:
-        caption = f'🎬 <b>Results for "{raw_title}"</b>\n'
+        caption = f"🎬 <b>{title}</b>\n"
 
     caption += "\n🔗 Select a source below:"
+    return caption
 
-    # Create inline buttons
+
+# ==========================================
+# Send Search Results
+# ==========================================
+async def send_results(update, title, category):
+    user_id = update.effective_user.id
+
+    status = await update.message.reply_text("🔍 Searching...")
+
+    info = get_tmdb_info(title)
+    search_title = info["title"] if info else title
+
+    results = search_category(search_title, category)
+
+    save_history(user_id, title, category)
+
+    if not results:
+        await status.edit_text("❌ No results found.")
+        return
+
+    caption = build_caption(info, title)
+
     keyboard = []
+
     for domain, url in results.items():
         keyboard.append([
             InlineKeyboardButton(domain, url=url)
         ])
 
+    # Add to favorites immediately
+    add_favorite(user_id, title, category)
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Send with poster if available
     try:
         if info and info.get("poster"):
             await update.message.reply_photo(
@@ -256,39 +333,111 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# --------------------------------------------------
-# Main function
-# --------------------------------------------------
+# ==========================================
+# Commands
+# ==========================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎬 Welcome to Advanced Movie Bot!\n\n"
+        "Commands:\n"
+        "/movie <title>\n"
+        "/tv <title>\n"
+        "/anime <title>\n"
+        "/game <title>\n"
+        "/favorites\n"
+        "/history"
+    )
+
+
+async def movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /movie Inception")
+        return
+    await send_results(update, " ".join(context.args), "movie")
+
+
+async def tv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /tv Breaking Bad")
+        return
+    await send_results(update, " ".join(context.args), "tv")
+
+
+async def anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /anime Naruto")
+        return
+    await send_results(update, " ".join(context.args), "anime")
+
+
+async def game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /game GTA V")
+        return
+    await send_results(update, " ".join(context.args), "game")
+
+
+async def favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_favorites(update.effective_user.id)
+
+    if not rows:
+        await update.message.reply_text("⭐ No favorites yet.")
+        return
+
+    lines = ["⭐ Your Favorites:\n"]
+
+    for title, category in rows:
+        lines.append(f"• [{category}] {title}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_history(update.effective_user.id)
+
+    if not rows:
+        await update.message.reply_text("🕒 No search history.")
+        return
+
+    lines = ["🕒 Recent Searches:\n"]
+
+    for title, category, searched_at in rows:
+        lines.append(f"• [{category}] {title}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+# ==========================================
+# Main Function
+# ==========================================
 def main():
-    print("✅ Bot is running on Railway...")
+    print("✅ Advanced Bot is running on Railway...")
     print("BOT_TOKEN:", bool(BOT_TOKEN))
     print("TMDB_API_KEY:", bool(TMDB_API_KEY))
 
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing!")
 
-    if not TMDB_API_KEY:
-        raise ValueError("TMDB_API_KEY is missing!")
+    init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("sites", sites_command))
+    app.add_handler(CommandHandler("movie", movie))
+    app.add_handler(CommandHandler("tv", tv))
+    app.add_handler(CommandHandler("anime", anime))
+    app.add_handler(CommandHandler("game", game))
+    app.add_handler(CommandHandler("favorites", favorites))
+    app.add_handler(CommandHandler("history", history))
 
-    # Handle normal messages
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
-    )
-
-    # Start bot
+    # Start polling
     app.run_polling(drop_pending_updates=True)
 
 
-# --------------------------------------------------
-# Entry point
-# --------------------------------------------------
+# ==========================================
+# Entry Point
+# ==========================================
 if __name__ == "__main__":
     try:
         main()
