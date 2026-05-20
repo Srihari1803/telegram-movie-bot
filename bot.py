@@ -141,20 +141,18 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is not set in .env")
+    print("✅ Bot is running. Press Ctrl+C to stop.")
+
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    print("✅ Bot is running. Press Ctrl+C to stop.")
-
     app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
