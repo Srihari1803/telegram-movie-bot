@@ -129,7 +129,7 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Format results
-    lines = [f'🎬 Results for "{title}":\n']
+    lines = [f'🎬 Results for "{title}":', ""]
 
     for domain, url in found:
         lines.append(f"• {domain}\n{url}\n")
@@ -142,15 +142,20 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     print("✅ Bot is running on Render...")
+    print("BOT_TOKEN:", bool(BOT_TOKEN))
+    print("TMDB_API_KEY:", bool(TMDB_API_KEY))
 
     # Verify environment variables
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing!")
+
     if not TMDB_API_KEY:
         raise ValueError("TMDB_API_KEY is missing!")
 
+    # Create Telegram application
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
