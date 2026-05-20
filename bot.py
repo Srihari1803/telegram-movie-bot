@@ -150,9 +150,15 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    # Keep the bot running forever
+    # Start the bot and keep the process alive
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("❌ Startup error:")
+        traceback.print_exc()
+        raise
