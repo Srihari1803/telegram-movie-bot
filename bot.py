@@ -5,7 +5,11 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 from ddgs import DDGS
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,8 +25,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 
+# --------------------------------------------------
+# Load sites from sites.json
+# --------------------------------------------------
 def load_sites():
-    """Load websites from sites.json"""
     try:
         with open("sites.json", "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -39,10 +45,12 @@ def load_sites():
     return []
 
 
-def normalize_title(title: str) -> str:
-    """Use TMDb to get the exact movie/TV title."""
+# --------------------------------------------------
+# Get movie/TV info from TMDb
+# --------------------------------------------------
+def get_tmdb_info(title: str):
     if not TMDB_API_KEY:
-        return title
+        return None
 
     try:
         url = "https://api.themoviedb.org/3/search/multi"
@@ -56,20 +64,35 @@ def normalize_title(title: str) -> str:
         data = response.json()
 
         results = data.get("results", [])
-        if results:
-            best = results[0]
-            return best.get("title") or best.get("name") or title
+        if not results:
+            return None
+
+        best = results[0]
+
+        return {
+            "title": best.get("title") or best.get("name") or title,
+            "year": (
+                (best.get("release_date") or best.get("first_air_date") or "")[:4]
+            ),
+            "rating": best.get("vote_average"),
+            "overview": best.get("overview"),
+            "poster": (
+                f"https://image.tmdb.org/t/p/w500{best['poster_path']}"
+                if best.get("poster_path")
+                else None
+            ),
+        }
 
     except Exception:
-        pass
-
-    return title
+        return None
 
 
+# --------------------------------------------------
+# Search one site using DuckDuckGo
+# --------------------------------------------------
 def search_site(title: str, site_url: str):
-    """Search one site using DuckDuckGo."""
     domain = urlparse(site_url).netloc.replace("www.", "")
-    query = f"{title} site:{domain}"
+    query = f'{title} site:{domain}'
 
     try:
         with DDGS() as ddgs:
@@ -86,85 +109,186 @@ def search_site(title: str, site_url: str):
     return None
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎬 Send me a movie or TV show title (e.g. Inception)."
-    )
-
-
-async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw_title = update.message.text.strip()
-
-    status = await update.message.reply_text("🔍 Searching...")
-
-    # Normalize title using TMDb
-    title = normalize_title(raw_title)
-
-    # Load sites
+# --------------------------------------------------
+# Search all configured sites
+# --------------------------------------------------
+def search_movie(title: str):
     sites = load_sites()
+    found = {}
 
-    if not sites:
-        await status.edit_text("❌ No sites found in sites.json.")
-        return
-
-    found = []
-
-    # Search all sites
     for site in sites:
         result = search_site(title, site)
 
         if result:
             domain = urlparse(site).netloc.replace("www.", "")
-            found.append((domain, result))
+            found[domain] = result
 
-        # Limit results
+        # Limit to 8 results
         if len(found) >= 8:
             break
 
-    # No results
-    if not found:
-        await status.edit_text(
-            f'❌ "{raw_title}" was not found on any of the {len(sites)} sites.'
-        )
-        return
+    return found
 
-    # Format results
-    lines = [f'🎬 Results for "{title}":', ""]
 
-    for domain, url in found:
-        lines.append(f"• {domain}\n{url}\n")
-
-    await status.edit_text(
-        "\n".join(lines),
-        disable_web_page_preview=True,
+# --------------------------------------------------
+# /start command
+# --------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎬 Welcome to Movie Search Bot!\n\n"
+        "Send me any movie or TV show title.\n"
+        "Example: Inception"
     )
 
 
+# --------------------------------------------------
+# /help command
+# --------------------------------------------------
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 How to use this bot:\n\n"
+        "1. Send any movie or TV show title.\n"
+        "2. The bot will search configured streaming sites.\n"
+        "3. You'll get clickable buttons with links.\n\n"
+        "Examples:\n"
+        "• Inception\n"
+        "• Breaking Bad\n"
+        "• Interstellar"
+    )
+
+
+# --------------------------------------------------
+# /sites command
+# --------------------------------------------------
+async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sites = load_sites()
+
+    if not sites:
+        await update.message.reply_text("❌ No sites configured.")
+        return
+
+    domains = []
+    for site in sites:
+        domains.append(urlparse(site).netloc.replace("www.", ""))
+
+    await update.message.reply_text(
+        "🌐 Configured sites:\n\n" + "\n".join(f"• {d}" for d in domains)
+    )
+
+
+# --------------------------------------------------
+# Handle movie title searches
+# --------------------------------------------------
+async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_title = update.message.text.strip()
+
+    status = await update.message.reply_text("🔍 Searching...")
+
+    # Get TMDb info
+    info = get_tmdb_info(raw_title)
+
+    if info:
+        title = info["title"]
+    else:
+        title = raw_title
+
+    # Search configured sites
+    results = search_movie(title)
+
+    if not results:
+        await status.edit_text(
+            f'❌ "{raw_title}" was not found on any configured sites.'
+        )
+        return
+
+    # Build caption
+    if info:
+        caption = f"🎬 <b>{info['title']}"
+        if info["year"]:
+            caption += f" ({info['year']})"
+        caption += "</b>\n"
+
+        if info["rating"]:
+            caption += f"⭐ {info['rating']:.1f}/10\n"
+
+        if info["overview"]:
+            overview = info["overview"]
+            if len(overview) > 400:
+                overview = overview[:400] + "..."
+            caption += f"\n{overview}\n"
+    else:
+        caption = f'🎬 <b>Results for "{raw_title}"</b>\n'
+
+    caption += "\n🔗 Select a source below:"
+
+    # Create inline buttons
+    keyboard = []
+    for domain, url in results.items():
+        keyboard.append([
+            InlineKeyboardButton(domain, url=url)
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Send with poster if available
+    try:
+        if info and info.get("poster"):
+            await update.message.reply_photo(
+                photo=info["poster"],
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            await status.delete()
+        else:
+            await status.edit_text(
+                caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+    except Exception:
+        await status.edit_text(
+            caption,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+
+
+# --------------------------------------------------
+# Main function
+# --------------------------------------------------
 def main():
-    print("✅ Bot is running on Render...")
+    print("✅ Bot is running on Railway...")
     print("BOT_TOKEN:", bool(BOT_TOKEN))
     print("TMDB_API_KEY:", bool(TMDB_API_KEY))
 
-    # Verify environment variables
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing!")
 
     if not TMDB_API_KEY:
         raise ValueError("TMDB_API_KEY is missing!")
 
-    # Create Telegram application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("sites", sites_command))
+
+    # Handle normal messages
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
     )
 
-    # Start polling
+    # Start bot
     app.run_polling(drop_pending_updates=True)
 
 
+# --------------------------------------------------
+# Entry point
+# --------------------------------------------------
 if __name__ == "__main__":
     try:
         main()
