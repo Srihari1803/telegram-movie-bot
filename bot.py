@@ -167,4 +167,4 @@ if __name__ == "__main__":
         import traceback
         print("❌ Startup error:")
         traceback.print_exc()
-                raise
+        raise
