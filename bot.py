@@ -141,12 +141,7 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    print("✅ Bot is running. Press Ctrl+C to stop.")
-
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    print("✅ Bot is running on Render...")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -155,4 +150,9 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    app.run_polling()
+    # Keep the bot running forever
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
