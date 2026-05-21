@@ -144,6 +144,18 @@ def add_favorite(user_id, title):
 
     conn.commit()
     conn.close()
+    
+def remove_favorite(user_id, title):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM favorites
+        WHERE user_id = ? AND title = ?
+    """, (user_id, title))
+
+    conn.commit()
+    conn.close()
 
 
 def get_favorites(user_id):
@@ -545,12 +557,20 @@ async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = "⭐ Favorites:\n\n"
+for row in rows:
+    title = row[0]
 
-    for row in rows:
-        text += f"• {row[0]}\n"
+    keyboard = [[
+        InlineKeyboardButton(
+            "❌ Remove",
+            callback_data=f"remove:{title}"
+        )
+    ]]
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        f"⭐ {title}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 # --------------------------------------------------
@@ -590,6 +610,18 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"⭐ Added to favorites:\n{title}"
         )
+
+    elif data.startswith("remove:"):
+    title = data.replace("remove:", "")
+
+    remove_favorite(
+        query.from_user.id,
+        title
+    )
+
+    await query.edit_message_text(
+    f"❌ Removed:\n{title}"
+    )
 
     elif data.startswith("ott:"):
         title = data.replace("ott:", "")
