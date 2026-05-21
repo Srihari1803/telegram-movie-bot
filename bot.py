@@ -557,20 +557,20 @@ async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-for row in rows:
-    title = row[0]
+    for row in rows:
+        title = row[0]
 
-    keyboard = [[
-        InlineKeyboardButton(
-            "❌ Remove",
-            callback_data=f"remove:{title}"
+        keyboard = [[
+            InlineKeyboardButton(
+                "❌ Remove",
+                callback_data=f"remove:{title}"
+            )
+        ]]
+
+        await update.message.reply_text(
+            f"⭐ {title}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-    ]]
-
-    await update.message.reply_text(
-        f"⭐ {title}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
 
 
 # --------------------------------------------------
@@ -607,12 +607,13 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         add_favorite(query.from_user.id, title)
 
-        await query.message.reply_text(
-            f"⭐ Added to favorites:\n{title}"
+        await query.answer(
+            text="Added to favorites ⭐",
+            show_alert=False
         )
 
     elif data.startswith("remove:"):
-    title = data.replace("remove:", "")
+         title = data.replace("remove:", "")
 
     remove_favorite(
         query.from_user.id,
@@ -620,7 +621,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await query.edit_message_text(
-    f"❌ Removed:\n{title}"
+        f"❌ Removed:\n{title}"
     )
 
     elif data.startswith("ott:"):
