@@ -1,4 +1,4 @@
-import json
+importimport json
 import os
 from urllib.parse import urlparse
 
@@ -28,9 +28,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
-import sqlite3
-
 DB_FILE = "bot.db"
+
+# FIX 1: Moved CACHE_DURATION and RESULTS_PER_PAGE outside get_history()
+CACHE_DURATION = 86400  # 24 hours
+RESULTS_PER_PAGE = 8
 
 
 def init_db():
@@ -67,7 +69,7 @@ def get_history(user_id):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
-    # Delete history older than 7 days
+    # Delete history older than 4 days
     cur.execute("""
         DELETE FROM history
         WHERE searched_at < datetime('now', '-4 days')
@@ -89,9 +91,6 @@ def get_history(user_id):
 
     conn.close()
     return rows
-    CACHE_DURATION = 86400  # 24 hours
-
-RESULTS_PER_PAGE = 8
 
 
 def add_favorite(user_id, title):
@@ -191,20 +190,21 @@ def save_cache(query, data):
 
 
 def parse_advanced_query(query):
+    # FIX 3: Corrected double-escaped regex patterns (\\d → \d, \\s → \s)
     season_episode = re.search(
-        r'(S\\d+E\\d+)',
+        r'(S\d+E\d+)',
         query,
         re.IGNORECASE
     )
 
     season = re.search(
-        r'Season\\s+(\\d+)',
+        r'Season\s+(\d+)',
         query,
         re.IGNORECASE
     )
 
     year = re.search(
-        r'(19\\d{2}|20\\d{2})',
+        r'(19\d{2}|20\d{2})',
         query
     )
 
@@ -384,7 +384,6 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_history(update.message.from_user.id, raw_title)
     status = await update.message.reply_text("🔍 Searching...")
 
-
     # Get TMDb info
     parsed = parse_advanced_query(raw_title)
     info = get_tmdb_info(parsed["query"])
@@ -394,7 +393,7 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         title = raw_title
 
-        # Search configured sites
+    # Search configured sites
     cached = get_cached(title)
 
     if cached:
@@ -409,39 +408,39 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Build caption
+    # FIX 2: Fixed caption-building block indentation and if/else structure
     if info:
         caption = f"🎬 <b>{info['title']}"
 
-    if info["year"]:
-        caption += f" ({info['year']})"
+        if info["year"]:
+            caption += f" ({info['year']})"
 
-    caption += "</b>\n"
-    
-    if info["rating"]:
-        caption += f"⭐ {info['rating']:.1f}/10\n"
+        caption += "</b>\n"
 
-    if info["overview"]:
-        overview = info["overview"]
-        
-        if len(overview) > 400:
-            overview = overview[:400] + "..."
+        if info["rating"]:
+            caption += f"⭐ {info['rating']:.1f}/10\n"
 
-        caption += f"\n{overview}\n"
+        if info["overview"]:
+            overview = info["overview"]
 
-else:
-    caption = f'🎬 <b>Results for "{raw_title}"</b>\n'
+            if len(overview) > 400:
+                overview = overview[:400] + "..."
+
+            caption += f"\n{overview}\n"
+
+    else:
+        caption = f'🎬 <b>Results for "{raw_title}"</b>\n'
 
     caption += "\n🔗 Select a source below:"
 
-        # Create inline buttons
+    # Create inline buttons
     keyboard = []
 
-        # Favorite button
+    # Favorite button
     keyboard.append([
-            InlineKeyboardButton(
-                "⭐ Favorite",
-                callback_data=f"fav:{title}"
+        InlineKeyboardButton(
+            "⭐ Favorite",
+            callback_data=f"fav:{title}"
         )
     ])
 
@@ -450,7 +449,7 @@ else:
         keyboard.append([
             InlineKeyboardButton(domain, url=url)
         ])
-        
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     # Send with poster if available
@@ -477,7 +476,8 @@ else:
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
-        
+
+
 # --------------------------------------------------
 # /favorites command
 # --------------------------------------------------
@@ -517,6 +517,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text)
 
+
 # --------------------------------------------------
 # Favorite button handler
 # --------------------------------------------------
@@ -536,6 +537,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⭐ Added to favorites:\n{title}"
         )
 
+
 # --------------------------------------------------
 # Main function
 # --------------------------------------------------
@@ -550,6 +552,9 @@ def main():
     if not TMDB_API_KEY:
         raise ValueError("TMDB_API_KEY is missing!")
 
+    # FIX 6: Added missing init_db() call
+    init_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Commands
@@ -563,8 +568,9 @@ def main():
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
     )
+    # FIX 4: Removed extra closing ) from CallbackQueryHandler
     app.add_handler(
-        CallbackQueryHandler(favorite_callback))
+        CallbackQueryHandler(favorite_callback)
     )
 
     # Start bot
