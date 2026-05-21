@@ -31,7 +31,7 @@ DB_FILE = "bot.db"
 
 # FIX 1: Moved CACHE_DURATION and RESULTS_PER_PAGE outside get_history()
 CACHE_DURATION = 86400  # 24 hours
-RESULTS_PER_PAGE = 8
+RESULTS_PER_PAGE = 5
 BUTTON_NAMES = {
     "lookmovie2.to": "🎬 LookMovie",
     "goku-tv.pics": "🍿 GokuTV",
@@ -367,10 +367,6 @@ def search_movie(title: str):
             domain = urlparse(site).netloc.replace("www.", "")
             found[domain] = result
 
-        # Limit to 8 results
-        if len(found) >= 8:
-            break
-
     return found
 
 
@@ -510,11 +506,24 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ])
 
     # Movie links
-    for domain, url in results.items():
-        name = BUTTON_NAMES.get(domain, domain)
+    all_results = list(results.items())
 
-        keyboard.append([
-            InlineKeyboardButton(name, url=url)
+context.user_data["results"] = all_results
+context.user_data["page"] = 0
+
+start = 0
+end = RESULTS_PER_PAGE
+
+for domain, url in all_results[start:end]:
+    name = BUTTON_NAMES.get(domain, domain)
+
+    keyboard.append([
+        InlineKeyboardButton(name, url=url)
+    ])
+
+if len(all_results) > RESULTS_PER_PAGE:
+    keyboard.append([
+        InlineKeyboardButton("Next ➡", callback_data="next")
     ])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -611,7 +620,63 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Added to favorites ⭐",
             show_alert=False
         )
+    elif data == "next" or data == "prev":
 
+    all_results = context.user_data.get("results", [])
+
+    page = context.user_data.get("page", 0)
+
+    if data == "next":
+        page += 1
+    else:
+        page -= 1
+
+    if page < 0:
+        page = 0
+
+    max_page = (len(all_results) - 1) // RESULTS_PER_PAGE
+
+    if page > max_page:
+        page = max_page
+
+    context.user_data["page"] = page
+
+    start = page * RESULTS_PER_PAGE
+    end = start + RESULTS_PER_PAGE
+
+    keyboard = []
+
+    for domain, url in all_results[start:end]:
+        name = BUTTON_NAMES.get(domain, domain)
+
+        keyboard.append([
+            InlineKeyboardButton(name, url=url)
+        ])
+
+    nav = []
+
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                "⬅ Previous",
+                callback_data="prev"
+            )
+        )
+
+    if page < max_page:
+        nav.append(
+            InlineKeyboardButton(
+                "Next ➡",
+                callback_data="next"
+            )
+        )
+
+    if nav:
+        keyboard.append(nav)
+
+    await query.edit_message_reply_markup(
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     elif data.startswith("remove:"):
         title = data.replace("remove:", "")
 
