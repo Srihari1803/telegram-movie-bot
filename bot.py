@@ -613,29 +613,29 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("remove:"):
-    title = data.replace("remove:", "")
+        title = data.replace("remove:", "")
 
-    remove_favorite(
-        query.from_user.id,
-        title
-    )
-
-    await query.edit_message_text(
-        f"❌ Removed:\n{title}"
-    )
-
-elif data.startswith("ott:"):
-    title = data.replace("ott:", "")
-
-    results = search_ott(title)
-
-    if not results:
-        await query.edit_message_text(
-            text=f"❌ No OTT results found for {title}"
+        remove_favorite(
+            query.from_user.id,
+            title
         )
-        return
 
-    keyboard = []
+        await query.edit_message_text(
+            f"❌ Removed:\n{title}"
+        )
+
+    elif data.startswith("ott:"):
+        title = data.replace("ott:", "")
+
+        results = search_ott(title)
+
+        if not results:
+            await query.edit_message_text(
+                text=f"❌ No OTT results found for {title}"
+            )
+            return
+
+        keyboard = []
 
     keyboard.append([
         InlineKeyboardButton(
