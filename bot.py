@@ -41,15 +41,30 @@ BUTTON_NAMES = {
     "uhdmovies.pink": "💎 UHD Movies",
     "moviesmod.farm": "🎞 MoviesMod",
 }
-OTT_SITES = [
-    "https://www.netflix.com",
-    "https://www.disneyplus.com",
-    "https://www.primevideo.com",
-    "https://www.crunchyroll.com",
-    "https://tv.apple.com",
-    "https://www.paramountplus.com",
-    "https://www.hbomax.com"
-]
+OTT_SITES = {
+    "DE": {
+        "Netflix Germany": "https://www.netflix.com/de/",
+        "Disney+ Germany": "https://www.disneyplus.com/de-de",
+        "Prime Video Germany": "https://www.primevideo.com"
+    },
+
+    "US": {
+        "Netflix USA": "https://www.netflix.com",
+        "Disney+ USA": "https://www.disneyplus.com",
+        "Max USA": "https://www.max.com"
+    },
+
+    "GB": {
+        "Netflix UK": "https://www.netflix.com/gb/",
+        "Disney+ UK": "https://www.disneyplus.com/en-gb"
+    },
+
+    "IN": {
+        "Netflix India": "https://www.netflix.com/in/",
+        "Disney+ Hotstar": "https://www.hotstar.com/in",
+        "Prime Video India": "https://www.primevideo.com"
+    }
+}
 
 
 def init_db():
@@ -348,14 +363,19 @@ def search_movie(title: str):
 
 
 def search_ott(title):
+    countries = ["DE", "US", "GB", "IN"]
+
     found = {}
 
-    for site in OTT_SITES:
-        result = search_site(title, site)
+    for country in countries:
 
-        if result:
-            domain = urlparse(site).netloc.replace("www.", "")
-            found[domain] = result
+        for name, site in OTT_SITES[country].items():
+
+            result = search_site(title, site)
+
+            if result:
+                found[f"{country} • {name}"] = result
+
 
     return found
 
