@@ -744,7 +744,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([
             InlineKeyboardButton(
                 "⬅ Back",
-                callback_data="back:main
+                callback_data="back:main"
             )
         ])
 
