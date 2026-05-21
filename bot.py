@@ -505,8 +505,8 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 ])
 
-    # Movie links
-        all_results = list(results.items())
+        # Movie links
+    all_results = list(results.items())
 
     context.user_data["results"] = all_results
     context.user_data["page"] = 0
@@ -623,7 +623,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Added to favorites ⭐",
             show_alert=False
         )
-        elif data == "next" or data == "prev":
+    elif data == "next" or data == "prev"::
 
         all_results = context.user_data.get("results", [])
 
@@ -692,7 +692,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Removed:\n{title}"
         )
 
-        elif data.startswith("ott:"):
+    elif data.startswith("ott:"):
         title = data.replace("ott:", "")
 
         results = search_ott(title)
