@@ -18,6 +18,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -502,6 +503,25 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 # --------------------------------------------------
+# Favorite button handler
+# --------------------------------------------------
+async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    await query.answer()
+
+    data = query.data
+
+    if data.startswith("fav:"):
+        title = data.replace("fav:", "")
+
+        add_favorite(query.from_user.id, title)
+
+        await query.message.reply_text(
+            f"⭐ Added to favorites:\n{title}"
+        )
+
+# --------------------------------------------------
 # Main function
 # --------------------------------------------------
 def main():
@@ -525,6 +545,7 @@ def main():
     # Handle normal messages
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
+    app.add_handler(CallbackQueryHandler(favorite_callback))
     )
 
     # Start bot
