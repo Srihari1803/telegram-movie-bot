@@ -410,23 +410,21 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Build caption
-if info:
-    caption = f"🎬 <b>{info['title']}"
+    if info:
+        caption = f"🎬 <b>{info['title']}"
 
     if info["year"]:
         caption += f" ({info['year']})"
 
     caption += "</b>\n"
+    
     if info["rating"]:
-
         caption += f"⭐ {info['rating']:.1f}/10\n"
 
     if info["overview"]:
-
         overview = info["overview"]
-
+        
         if len(overview) > 400:
-
             overview = overview[:400] + "..."
 
         caption += f"\n{overview}\n"
@@ -558,11 +556,15 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("sites", sites_command))
+    app.add_handler(CommandHandler("favorites", favorites_command))
+    app.add_handler(CommandHandler("history", history_command))
 
     # Handle normal messages
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, search_title)
-    app.add_handler(CallbackQueryHandler(favorite_callback))
+    )
+    app.add_handler(
+        CallbackQueryHandler(favorite_callback))
     )
 
     # Start bot
