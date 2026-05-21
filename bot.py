@@ -509,6 +509,7 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_results = list(results.items())
 
     context.user_data["results"] = all_results
+    context.user_data["current_title"] = title
     context.user_data["page"] = 0
 
     start = 0
@@ -623,7 +624,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Added to favorites ⭐",
             show_alert=False
         )
-    elif data == "next" or data == "prev"::
+    elif data == "next" or data == "prev":
 
         all_results = context.user_data.get("results", [])
 
@@ -647,7 +648,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start = page * RESULTS_PER_PAGE
         end = start + RESULTS_PER_PAGE
 
-        keyboard = []
+        keyboard = [[     InlineKeyboardButton(         "⭐ Favorite",         callback_data=f"fav:{context.user_data.get('current_title', '')}"     ),     InlineKeyboardButton(         "📺 OTT",         callback_data=f"ott:{context.user_data.get('current_title', '')}"     ) ]]
 
         for domain, url in all_results[start:end]:
             name = BUTTON_NAMES.get(domain, domain)
@@ -691,7 +692,42 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"❌ Removed:\n{title}"
         )
+    elif data.startswith("back:"):
 
+    all_results = context.user_data.get("results", [])
+
+    context.user_data["page"] = 0
+
+    keyboard = [[
+    InlineKeyboardButton(
+        "⭐ Favorite",
+        callback_data=f"fav:{context.user_data.get('current_title', '')}"
+    ),
+    InlineKeyboardButton(
+        "📺 OTT",
+        callback_data=f"ott:{context.user_data.get('current_title', '')}"
+    )
+]]
+
+    for domain, url in all_results[:RESULTS_PER_PAGE]:
+        name = BUTTON_NAMES.get(domain, domain)
+
+        keyboard.append([
+            InlineKeyboardButton(name, url=url)
+        ])
+
+    if len(all_results) > RESULTS_PER_PAGE:
+        keyboard.append([
+            InlineKeyboardButton(
+                "Next ➡",
+                callback_data="next"
+            )
+        ])
+
+    await query.edit_message_reply_markup(
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
     elif data.startswith("ott:"):
         title = data.replace("ott:", "")
 
@@ -708,7 +744,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([
             InlineKeyboardButton(
                 "⬅ Back",
-                callback_data=f"back:{title}"
+                elif data.startswith("back:"):
             )
         ])
 
