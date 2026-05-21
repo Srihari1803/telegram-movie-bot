@@ -453,7 +453,45 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
+        
+# --------------------------------------------------
+# /favorites command
+# --------------------------------------------------
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_favorites(update.message.from_user.id)
 
+    if not rows:
+        await update.message.reply_text(
+            "❌ No favorites saved."
+        )
+        return
+
+    text = "⭐ Favorites:\n\n"
+
+    for row in rows:
+        text += f"• {row[0]}\n"
+
+    await update.message.reply_text(text)
+
+
+# --------------------------------------------------
+# /history command
+# --------------------------------------------------
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_history(update.message.from_user.id)
+
+    if not rows:
+        await update.message.reply_text(
+            "❌ No history found."
+        )
+        return
+
+    text = "🕘 Search History:\n\n"
+
+    for row in rows:
+        text += f"• {row[0]}\n"
+
+    await update.message.reply_text(text)
 
 # --------------------------------------------------
 # Main function
