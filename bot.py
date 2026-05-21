@@ -393,14 +393,14 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         title = raw_title
 
-    # Search configured sites
+        # Search configured sites
     cached = get_cached(title)
 
-if cached:
-    results = cached
-else:
-    results = search_movie(title)
-    save_cache(title, results)
+    if cached:
+        results = cached
+    else:
+        results = search_movie(title)
+        save_cache(title, results)
 
     if not results:
         await status.edit_text(
