@@ -564,41 +564,40 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("fav:"):
-    title = data.replace("fav:", "")
+        title = data.replace("fav:", "")
 
-    add_favorite(query.from_user.id, title)
+        add_favorite(query.from_user.id, title)
 
-    await query.message.reply_text(
-        f"⭐ Added to favorites:\n{title}"
-    )
-
-elif data.startswith("ott:"):
-    title = data.replace("ott:", "")
-
-    await query.message.reply_text(
-        f"📺 Searching OTT platforms for {title}..."
-    )
-
-    results = search_ott(title)
-
-    if not results:
         await query.message.reply_text(
-            "❌ Not found on any OTT provider."
+            f"⭐ Added to favorites:\n{title}"
         )
-        return
 
-    keyboard = []
+    elif data.startswith("ott:"):
+        title = data.replace("ott:", "")
 
-    for name, url in results.items():
-        keyboard.append([
-            InlineKeyboardButton(name, url=url)
-        ])
+        await query.message.reply_text(
+            f"📺 Searching OTT platforms for {title}..."
+        )
 
-    await query.message.reply_text(
-        f"📺 OTT results for {title}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        results = search_ott(title)
 
+        if not results:
+            await query.message.reply_text(
+                "❌ Not found on any OTT provider."
+            )
+            return
+
+        keyboard = []
+
+        for name, url in results.items():
+            keyboard.append([
+                InlineKeyboardButton(name, url=url)
+            ])
+
+        await query.message.reply_text(
+            f"📺 OTT results for {title}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 # --------------------------------------------------
 # Main function
