@@ -1,7 +1,6 @@
 import json
 import os
 from urllib.parse import urlparse
-
 import requests
 import sqlite3
 import time
@@ -42,6 +41,15 @@ BUTTON_NAMES = {
     "uhdmovies.pink": "💎 UHD Movies",
     "moviesmod.farm": "🎞 MoviesMod",
 }
+OTT_SITES = [
+    "https://www.netflix.com",
+    "https://www.disneyplus.com",
+    "https://www.primevideo.com",
+    "https://www.crunchyroll.com",
+    "https://tv.apple.com",
+    "https://www.paramountplus.com",
+    "https://www.hbomax.com"
+]
 
 
 def init_db():
@@ -339,6 +347,18 @@ def search_movie(title: str):
     return found
 
 
+def search_ott(title):
+    found = {}
+
+    for site in OTT_SITES:
+        result = search_site(title, site)
+
+        if result:
+            domain = urlparse(site).netloc.replace("www.", "")
+            found[domain] = result
+
+    return found
+
 # --------------------------------------------------
 # /start command
 # --------------------------------------------------
@@ -447,11 +467,15 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Favorite button
     keyboard.append([
-        InlineKeyboardButton(
-            "⭐ Favorite",
-            callback_data=f"fav:{title}"
-        )
-    ])
+    InlineKeyboardButton(
+        "⭐ Favorite",
+        callback_data=f"fav:{title}"
+    ),
+    InlineKeyboardButton(
+        "📺 OTT",
+        callback_data=f"ott:{title}"
+    )
+])
 
     # Movie links
     for domain, url in results.items():
@@ -540,13 +564,40 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("fav:"):
-        title = data.replace("fav:", "")
+    title = data.replace("fav:", "")
 
-        add_favorite(query.from_user.id, title)
+    add_favorite(query.from_user.id, title)
 
+    await query.message.reply_text(
+        f"⭐ Added to favorites:\n{title}"
+    )
+
+elif data.startswith("ott:"):
+    title = data.replace("ott:", "")
+
+    await query.message.reply_text(
+        f"📺 Searching OTT platforms for {title}..."
+    )
+
+    results = search_ott(title)
+
+    if not results:
         await query.message.reply_text(
-            f"⭐ Added to favorites:\n{title}"
+            "❌ Not found on any OTT provider."
         )
+        return
+
+    keyboard = []
+
+    for name, url in results.items():
+        keyboard.append([
+            InlineKeyboardButton(name, url=url)
+        ])
+
+    await query.message.reply_text(
+        f"📺 OTT results for {title}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 # --------------------------------------------------
