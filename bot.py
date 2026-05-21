@@ -24,6 +24,68 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
+import sqlite3
+
+DB_FILE = "bot.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            title TEXT,
+            searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_history(user_id, title):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO history (user_id, title)
+        VALUES (?, ?)
+    """, (user_id, title))
+
+    conn.commit()
+    conn.close()
+
+
+def get_history(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    # Delete history older than 7 days
+    cur.execute("""
+        DELETE FROM history
+        WHERE searched_at < datetime('now', '-4 days')
+    """)
+
+    conn.commit()
+
+    # Remove duplicates and get latest 10
+    cur.execute("""
+        SELECT title, MAX(searched_at)
+        FROM history
+        WHERE user_id = ?
+        GROUP BY title
+        ORDER BY MAX(searched_at) DESC
+        LIMIT 10
+    """, (user_id,))
+
+    rows = cur.fetchall()
+
+    conn.close()
+    return rows
+
 
 # --------------------------------------------------
 # Load sites from sites.json
