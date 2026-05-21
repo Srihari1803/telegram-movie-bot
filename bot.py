@@ -380,11 +380,13 @@ async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------
 async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_title = update.message.text.strip()
-
+    save_history(update.message.from_user.id, raw_title)
     status = await update.message.reply_text("🔍 Searching...")
 
+
     # Get TMDb info
-    info = get_tmdb_info(raw_title)
+    parsed = parse_advanced_query(raw_title)
+    info = get_tmdb_info(parsed["query"])
 
     if info:
         title = info["title"]
@@ -392,7 +394,13 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = raw_title
 
     # Search configured sites
+    cached = get_cached(title)
+
+if cached:
+    results = cached
+else:
     results = search_movie(title)
+    save_cache(title, results)
 
     if not results:
         await status.edit_text(
