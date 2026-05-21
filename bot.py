@@ -593,31 +593,64 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("ott:"):
-        title = data.replace("ott:", "")
+    title = data.replace("ott:", "")
 
-        await query.message.reply_text(
-            f"📺 Searching OTT platforms for {title}..."
+    results = search_ott(title)
+
+    if not results:
+        await query.edit_message_text(
+            text=f"❌ No OTT results found for {title}"
         )
+        return
 
-        results = search_ott(title)
+    keyboard = []
 
-        if not results:
-            await query.message.reply_text(
-                "❌ Not found on any OTT provider."
-            )
-            return
-
-        keyboard = []
-
-        for name, url in results.items():
-            keyboard.append([
-                InlineKeyboardButton(name, url=url)
-            ])
-
-        await query.message.reply_text(
-            f"📺 OTT results for {title}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+    keyboard.append([
+        InlineKeyboardButton(
+            "⬅ Back",
+            callback_data=f"back:{title}"
         )
+    ])
+
+    for name, url in results.items():
+        keyboard.append([
+            InlineKeyboardButton(name, url=url)
+        ])
+
+    await query.edit_message_text(
+        text=f"📺 OTT Results for {title}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+elif data.startswith("back:"):
+    title = data.replace("back:", "")
+
+    results = search_movie(title)
+
+    keyboard = []
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "⭐ Favorite",
+            callback_data=f"fav:{title}"
+        ),
+        InlineKeyboardButton(
+            "📺 OTT",
+            callback_data=f"ott:{title}"
+        )
+    ])
+
+    for domain, url in results.items():
+        name = BUTTON_NAMES.get(domain, domain)
+
+        keyboard.append([
+            InlineKeyboardButton(name, url=url)
+        ])
+
+    await query.edit_message_text(
+        text=f"🎬 Results for {title}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 # --------------------------------------------------
 # Main function
