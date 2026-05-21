@@ -33,6 +33,15 @@ DB_FILE = "bot.db"
 # FIX 1: Moved CACHE_DURATION and RESULTS_PER_PAGE outside get_history()
 CACHE_DURATION = 86400  # 24 hours
 RESULTS_PER_PAGE = 8
+BUTTON_NAMES = {
+    "lookmovie2.to": "🎬 LookMovie",
+    "goku-tv.pics": "🍿 GokuTV",
+    "hurawatch.art": "📺 HuraWatch",
+    "www8.123moviesfree.net": "🎥 123Movies",
+    "desicinemas.to": "🇮🇳 DesiCinema",
+    "uhdmovies.pink": "💎 UHD Movies",
+    "moviesmod.farm": "🎞 MoviesMod",
+}
 
 
 def init_db():
@@ -446,9 +455,11 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Movie links
     for domain, url in results.items():
+        name = BUTTON_NAMES.get(domain, domain)
+
         keyboard.append([
-            InlineKeyboardButton(domain, url=url)
-        ])
+            InlineKeyboardButton(name, url=url)
+    ])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
