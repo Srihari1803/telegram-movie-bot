@@ -429,8 +429,18 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption += "\n🔗 Select a source below:"
 
-    # Create inline buttons
-    keyboard = []
+        # Create inline buttons
+        keyboard = []
+
+        # Favorite button
+        keyboard.append([
+            InlineKeyboardButton(
+                "⭐ Favorite",
+                callback_data=f"fav:{title}"
+        )
+    ])
+
+    # Movie links
     for domain, url in results.items():
         keyboard.append([
             InlineKeyboardButton(domain, url=url)
