@@ -3,6 +3,9 @@ import os
 from urllib.parse import urlparse
 
 import requests
+import sqlite3
+import time
+import re
 from dotenv import load_dotenv
 from ddgs import DDGS
 from telegram import (
@@ -85,6 +88,140 @@ def get_history(user_id):
 
     conn.close()
     return rows
+    CACHE_DURATION = 86400  # 24 hours
+
+RESULTS_PER_PAGE = 8
+
+
+def add_favorite(user_id, title):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            title TEXT
+        )
+    """)
+
+    cur.execute("""
+        INSERT INTO favorites (user_id, title)
+        VALUES (?, ?)
+    """, (user_id, title))
+
+    conn.commit()
+    conn.close()
+
+
+def get_favorites(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT title
+        FROM favorites
+        WHERE user_id = ?
+        ORDER BY id DESC
+    """, (user_id,))
+
+    rows = cur.fetchall()
+
+    conn.close()
+    return rows
+
+
+def get_cached(query):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cache (
+            query TEXT PRIMARY KEY,
+            data TEXT,
+            created_at INTEGER
+        )
+    """)
+
+    cur.execute("""
+        SELECT data, created_at
+        FROM cache
+        WHERE query = ?
+    """, (query,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    if not row:
+        return None
+
+    data, created_at = row
+
+    if time.time() - created_at > CACHE_DURATION:
+        return None
+
+    return json.loads(data)
+
+
+def save_cache(query, data):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cache (
+            query TEXT PRIMARY KEY,
+            data TEXT,
+            created_at INTEGER
+        )
+    """)
+
+    cur.execute("""
+        INSERT OR REPLACE INTO cache (query, data, created_at)
+        VALUES (?, ?, ?)
+    """, (
+        query,
+        json.dumps(data),
+        int(time.time())
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def parse_advanced_query(query):
+    season_episode = re.search(
+        r'(S\\d+E\\d+)',
+        query,
+        re.IGNORECASE
+    )
+
+    season = re.search(
+        r'Season\\s+(\\d+)',
+        query,
+        re.IGNORECASE
+    )
+
+    year = re.search(
+        r'(19\\d{2}|20\\d{2})',
+        query
+    )
+
+    return {
+        "query": query,
+        "season_episode": (
+            season_episode.group(1)
+            if season_episode else None
+        ),
+        "season": (
+            season.group(1)
+            if season else None
+        ),
+        "year": (
+            year.group(1)
+            if year else None
+        )
+    }
 
 
 # --------------------------------------------------
