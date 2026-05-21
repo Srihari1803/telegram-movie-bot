@@ -410,30 +410,37 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Build caption
-    if info:
-        caption = f"🎬 <b>{info['title']}"
-        if info["year"]:
-            caption += f" ({info['year']})"
-        caption += "</b>\n"
+if info:
+    caption = f"🎬 <b>{info['title']}"
 
-        if info["rating"]:
-            caption += f"⭐ {info['rating']:.1f}/10\n"
+    if info["year"]:
+        caption += f" ({info['year']})"
 
-        if info["overview"]:
-            overview = info["overview"]
-            if len(overview) > 400:
-                overview = overview[:400] + "..."
-            caption += f"\n{overview}\n"
-    else:
-        caption = f'🎬 <b>Results for "{raw_title}"</b>\n'
+    caption += "</b>\n"
+    if info["rating"]:
+
+        caption += f"⭐ {info['rating']:.1f}/10\n"
+
+    if info["overview"]:
+
+        overview = info["overview"]
+
+        if len(overview) > 400:
+
+            overview = overview[:400] + "..."
+
+        caption += f"\n{overview}\n"
+
+else:
+    caption = f'🎬 <b>Results for "{raw_title}"</b>\n'
 
     caption += "\n🔗 Select a source below:"
 
         # Create inline buttons
-        keyboard = []
+    keyboard = []
 
         # Favorite button
-        keyboard.append([
+    keyboard.append([
             InlineKeyboardButton(
                 "⭐ Favorite",
                 callback_data=f"fav:{title}"
@@ -445,7 +452,7 @@ async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([
             InlineKeyboardButton(domain, url=url)
         ])
-
+        
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     # Send with poster if available
