@@ -578,7 +578,6 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------
 async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
     await query.answer()
 
     data = query.data
@@ -593,64 +592,64 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("ott:"):
-    title = data.replace("ott:", "")
+        title = data.replace("ott:", "")
 
-    results = search_ott(title)
+        results = search_ott(title)
 
-    if not results:
+        if not results:
+            await query.edit_message_text(
+                text=f"❌ No OTT results found for {title}"
+            )
+            return
+
+        keyboard = []
+
+        keyboard.append([
+            InlineKeyboardButton(
+                "⬅ Back",
+                callback_data=f"back:{title}"
+            )
+        ])
+
+        for name, url in results.items():
+            keyboard.append([
+                InlineKeyboardButton(name, url=url)
+            ])
+
         await query.edit_message_text(
-            text=f"❌ No OTT results found for {title}"
+            text=f"📺 OTT Results for {title}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return
 
-    keyboard = []
+    elif data.startswith("back:"):
+        title = data.replace("back:", "")
 
-    keyboard.append([
-        InlineKeyboardButton(
-            "⬅ Back",
-            callback_data=f"back:{title}"
-        )
-    ])
+        results = search_movie(title)
 
-    for name, url in results.items():
-        keyboard.append([
-            InlineKeyboardButton(name, url=url)
-        ])
-
-    await query.edit_message_text(
-        text=f"📺 OTT Results for {title}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-elif data.startswith("back:"):
-    title = data.replace("back:", "")
-
-    results = search_movie(title)
-
-    keyboard = []
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "⭐ Favorite",
-            callback_data=f"fav:{title}"
-        ),
-        InlineKeyboardButton(
-            "📺 OTT",
-            callback_data=f"ott:{title}"
-        )
-    ])
-
-    for domain, url in results.items():
-        name = BUTTON_NAMES.get(domain, domain)
+        keyboard = []
 
         keyboard.append([
-            InlineKeyboardButton(name, url=url)
+            InlineKeyboardButton(
+                "⭐ Favorite",
+                callback_data=f"fav:{title}"
+            ),
+            InlineKeyboardButton(
+                "📺 OTT",
+                callback_data=f"ott:{title}"
+            )
         ])
 
-    await query.edit_message_text(
-        text=f"🎬 Results for {title}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        for domain, url in results.items():
+            name = BUTTON_NAMES.get(domain, domain)
+
+            keyboard.append([
+                InlineKeyboardButton(name, url=url)
+            ])
+
+        await query.edit_message_text(
+            text=f"🎬 Results for {title}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 # --------------------------------------------------
 # Main function
