@@ -59,13 +59,13 @@ CATEGORY_META = {
     CATEGORY_ANIME: {"label": "Anime", "icon": "🍿"},
     CATEGORY_GAME: {"label": "Game", "icon": "🎮"},
 }
-
-SEARCH_CATEGORIES = [
-    CATEGORY_MOVIE,
-    CATEGORY_TV,
-    CATEGORY_ANIME,
-    CATEGORY_GAME,
 ]
+CATEGORY_SITES = {
+    CATEGORY_MOVIE: MOVIE_SITES,
+    CATEGORY_TV: TV_SITES,
+    CATEGORY_ANIME: ANIME_SITES,
+    CATEGORY_GAME: GAME_SITES,
+}
 
 GAME_KEYWORDS = {
     "game",
@@ -136,14 +136,7 @@ COUNTRY_INFO = {
     "GB": {"flag": "🇬🇧", "name": "UK"},
     "IN": {"flag": "🇮🇳", "name": "India"},
 }
-# 
-]
-CATEGORY_SITES = {
-    CATEGORY_MOVIE: MOVIE_SITES,
-    CATEGORY_TV: TV_SITES,
-    CATEGORY_ANIME: ANIME_SITES,
-    CATEGORY_GAME: GAME_SITES,
-}
+#
 
 
 # --------------------------------------------------
