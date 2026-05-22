@@ -136,72 +136,7 @@ COUNTRY_INFO = {
     "GB": {"flag": "🇬🇧", "name": "UK"},
     "IN": {"flag": "🇮🇳", "name": "India"},
 }
-
-# Change 1: Category-specific site lists
-MOVIE_SITES = [
-    "https://lookmovie2.to",
-    "https://hurawatch.art",
-    "https://ww8.123moviesfree.net",
-    "https://new1.hdhub4u.limo",
-    "https://desicinemas.to",
-    "https://uhdmovies.pink",
-    "https://moviesmod.farm",
-    "https://ww25.soap2day.day",
-    "https://themoviesflix.moe",
-    "https://mayamovie.org",
-    "https://putlocker-hd.xyz",
-    "https://cataz.my",
-    "https://guideflix.to",
-    "https://filmslook.com",
-    "https://solarmoviesz.com",
-    "https://flixhqz.com",
-    "https://movie4k.sx",
-    "https://yomovies.courses",
-    "https://cinemalux.skin",
-    "https://todaypk.beauty",
-    "https://vegamovies.diamonds"
-]
-
-TV_SITES = [
-    "https://goku-tv.pics",
-    "https://watchseries.bar",
-    "https://newprimewire.cc",
-    "https://hurawatch.cx",
-    "https://hurawatch.art",
-    "https://flixhqz.com",
-    "https://ww25.soap2day.day",
-    "https://lookmovie2.to",
-    "https://ww19.myasiantv.es"
-]
-
-ANIME_SITES = [
-    "https://animeflix.dad",
-    "https://9anime.digital",
-    "https://aniwaves.ru",
-    "https://gogoanime.by",
-    "https://anitaku.com.ro",
-    "https://animeheaven.me",
-    "https://animixplay.com.ro",
-    "https://kickassanime.com.es",
-    "https://animefreak.to",
-    "https://animedao.in",
-    "https://animesuge.cz"
-]
-
-GAME_SITES = [
-    "https://fitgirl-repacks.site",
-    "https://dodi-repacks.site",
-    "https://steamunlocked.net",
-    "https://oceanofgames.com",
-    "https://igg-games.com",
-    "https://gamesdrive.net",
-    "https://pcgamestorrents.com",
-    "https://repack-games.com",
-    "https://crohasit.net",
-    "https://apunkagames.net",
-    "https://gload.to",
-    "https://elamigos.site",
-    "https://steamrip.com"
+# 
 ]
 CATEGORY_SITES = {
     CATEGORY_MOVIE: MOVIE_SITES,
@@ -574,25 +509,24 @@ def resolve_cached_category_results(cached_payload: Any) -> dict[str, str]:
 # --------------------------------------------------
 # Load sites from sites.json
 # --------------------------------------------------
-def load_sites():
-    global SITES_CACHE, SITES_CACHE_LAST_MTIME
+def load_sites(category=None):
     try:
-        mtime = os.path.getmtime("sites.json")
-        if SITES_CACHE is not None and SITES_CACHE_LAST_MTIME == mtime:
-            return SITES_CACHE
         with open("sites.json", "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            SITES_CACHE = data
-            SITES_CACHE_LAST_MTIME = mtime
-            return data
-        if isinstance(data, dict):
-            SITES_CACHE = data.get("sites", [])
-            SITES_CACHE_LAST_MTIME = mtime
-            return SITES_CACHE
+
+        if category:
+            return data.get(category, [])
+
+        all_sites = []
+
+        for category_sites in data.values():
+            all_sites.extend(category_sites)
+
+        return all_sites
+
     except Exception:
-        logger.exception("Failed to load sites.json from current directory")
-    return []
+        logger.exception("Failed to load sites.json")
+        return []
 
 
 # --------------------------------------------------
@@ -761,7 +695,7 @@ def search_movie(
 
 # Change 3: New fast category-aware search function
 def search_category_sites(title: str, category: str) -> dict[str, str]:
-    sites = CATEGORY_SITES.get(category, [])
+    sites = load_sites(category)
 
     found = {}
 
@@ -1062,15 +996,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /sites command
 # --------------------------------------------------
 async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sites = load_sites()
-    if not sites:
-        await update.message.reply_text("❌ No sites configured.")
-        return
-    domains = [urlparse(site).netloc.replace("www.", "") for site in sites]
-    await update.message.reply_text(
-        "🌐 Configured sites:\n\n" + "\n".join(f"• {d}" for d in domains)
-    )
+    try:
+        with open("sites.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
 
+        text = "🌐 Configured Sites\n\n"
+
+        for category, sites in data.items():
+            text += f"📂 {category.upper()} ({len(sites)})\n"
+
+            for site in sites:
+                domain = urlparse(site).netloc.replace("www.", "")
+                text += f"• {domain}\n"
+
+            text += "\n"
+
+        await update.message.reply_text(text)
+
+    except Exception:
+        await update.message.reply_text("❌ Could not load sites.json")
 
 # --------------------------------------------------
 # Search commands
