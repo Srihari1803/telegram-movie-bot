@@ -1,11 +1,13 @@
+import asyncio
 import json
 import logging
 import os
 import re
 import sqlite3
 import time
-from difflib import SequenceMatcher
-from typing import Any, Awaitable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from typing import Any, Awaitable, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -47,6 +49,8 @@ CACHE_PREFIX_MOVIE = "movie"
 CACHE_PREFIX_OTT = "ott"
 CACHE_PREFIX_TMDB = "tmdb"
 CACHE_EMPTY_MARKER = {"_empty": True}
+SUPPORTED_TMDB_MEDIA_TYPES = {"movie", "tv"}
+MAX_TMDB_RATING = 10
 
 CATEGORY_MOVIE = "movie"
 CATEGORY_TV = "tv"
@@ -66,35 +70,36 @@ SEARCH_CATEGORIES = [
     CATEGORY_ANIME,
     CATEGORY_GAME,
 ]
-GAME_KEYWORDS = {
-    "game",
-    "games",
-    "gaming",
-    "pc",
-    "steam",
-    "xbox",
-    "playstation",
-    "ps4",
-    "ps5",
-    "switch",
-    "nintendo",
-    "apk",
-    "repack",
-}
-
-ANIME_KEYWORDS = {
-    "anime",
-    "ova",
-    "shonen",
-    "seinen",
-    "manga",
-}
-
 logger = logging.getLogger(__name__)
 
-# Cache sites.json content and its modification time to avoid repeated file reads.
-SITES_CACHE = None
-SITES_CACHE_LAST_MTIME = None
+@contextmanager
+def db_connection(commit: bool = False) -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        yield conn
+        if commit:
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def load_category_sites() -> Dict[str, List[str]]:
+    try:
+        with open("sites.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        logger.exception(
+            "Failed to load sites.json. Please verify the file exists and contains valid JSON."
+        )
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        CATEGORY_MOVIE: list(data.get(CATEGORY_MOVIE, [])),
+        CATEGORY_TV: list(data.get(CATEGORY_TV, [])),
+        CATEGORY_ANIME: list(data.get(CATEGORY_ANIME, [])),
+        CATEGORY_GAME: list(data.get(CATEGORY_GAME, [])),
+    }
 
 BUTTON_NAMES = {
     "lookmovie2.to": "🎬 LookMovie",
@@ -142,9 +147,8 @@ COUNTRY_INFO = {
 # Database helpers
 # --------------------------------------------------
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+    with db_connection(commit=True) as conn:
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -152,44 +156,37 @@ def init_db():
             searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cur.execute("""
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS favorites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             title TEXT
         )
     """)
-    cur.execute("""
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS cache (
             query TEXT PRIMARY KEY,
             data TEXT,
             created_at INTEGER
         )
     """)
-    conn.commit()
-    conn.close()
 
 
-def save_history(user_id, title):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+def save_history(user_id: int, title: str) -> None:
+    with db_connection(commit=True) as conn:
+        conn.execute("""
         INSERT INTO history (user_id, title)
         VALUES (?, ?)
     """, (user_id, title))
-    conn.commit()
-    conn.close()
 
 
-def get_history(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+def get_history(user_id: int) -> List[Tuple[str, str]]:
+    with db_connection(commit=True) as conn:
+        conn.execute("""
         DELETE FROM history
         WHERE searched_at < datetime('now', '-4 days')
     """)
-    conn.commit()
-    cur.execute("""
+        rows = conn.execute("""
         SELECT title, MAX(searched_at)
         FROM history
         WHERE user_id = ?
@@ -197,111 +194,85 @@ def get_history(user_id):
         ORDER BY MAX(searched_at) DESC
         LIMIT 10
     """, (user_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+        return rows.fetchall()
 
 
-def add_favorite(user_id, title):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+def add_favorite(user_id: int, title: str) -> None:
+    with db_connection(commit=True) as conn:
+        conn.execute("""
         INSERT INTO favorites (user_id, title)
         VALUES (?, ?)
     """, (user_id, title))
-    conn.commit()
-    conn.close()
 
 
-def remove_favorite(user_id, title):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+def remove_favorite(user_id: int, title: str) -> None:
+    with db_connection(commit=True) as conn:
+        conn.execute("""
         DELETE FROM favorites
         WHERE user_id = ? AND title = ?
     """, (user_id, title))
-    conn.commit()
-    conn.close()
 
 
-def get_favorites(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+def get_favorites(user_id: int) -> List[Tuple[str]]:
+    with db_connection() as conn:
+        rows = conn.execute("""
         SELECT title
         FROM favorites
         WHERE user_id = ?
         ORDER BY id DESC
     """, (user_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+        return rows.fetchall()
 
 
-def make_cache_key(prefix: str, query: str) -> str | None:
+def make_cache_key(prefix: str, query: str) -> Optional[str]:
     normalized = normalize_title(query)
     if not normalized:
         return None
     return f"{prefix}:{normalized}"
 
 
-def delete_cache(cache_key):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
-        DELETE FROM cache
-        WHERE query = ?
-    """, (cache_key,))
-    conn.commit()
-    conn.close()
-
-
-def get_cached(cache_key):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+def get_cached(cache_key: str) -> Optional[Any]:
+    with db_connection(commit=True) as conn:
+        row = conn.execute("""
         SELECT data, created_at
         FROM cache
         WHERE query = ?
     """, (cache_key,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    data, created_at = row
-    if time.time() - created_at > CACHE_DURATION:
-        delete_cache(cache_key)
-        return None
-    try:
-        return json.loads(data)
-    except json.JSONDecodeError:
-        delete_cache(cache_key)
-        return None
+        row = row.fetchone()
+        if not row:
+            return None
+        data, created_at = row
+        if time.time() - created_at > CACHE_DURATION:
+            conn.execute(
+                "DELETE FROM cache WHERE query = ?",
+                (cache_key,),
+            )
+            return None
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            conn.execute(
+                "DELETE FROM cache WHERE query = ?",
+                (cache_key,),
+            )
+            return None
 
 
-def save_cache(cache_key, data):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
+def save_cache(cache_key: str, data: Any) -> None:
+    with db_connection(commit=True) as conn:
+        conn.execute("""
         INSERT OR REPLACE INTO cache (query, data, created_at)
         VALUES (?, ?, ?)
     """, (cache_key, json.dumps(data), int(time.time())))
-    conn.commit()
-    conn.close()
 
 
-def get_cached_for_titles(prefix: str, titles: list[str]) -> tuple[dict | None, str | None]:
-    """Return (cached_data, cache_key), or (None, None) when no cache hit exists."""
-    for title in titles:
-        if not title:
-            continue
-        cache_key = make_cache_key(prefix, title)
-        if not cache_key:
-            continue
-        cached = get_cached(cache_key)
-        if cached is not None:
-            return cached, cache_key
-    return None, None
+def cleanup_cache() -> None:
+    cutoff = int(time.time()) - CACHE_DURATION
+    with db_connection(commit=True) as conn:
+        conn.execute(
+            "DELETE FROM cache WHERE created_at < ?",
+            (cutoff,),
+        )
 
 
 def is_empty_cache(cached) -> bool:
@@ -335,87 +306,13 @@ def normalize_title(title: str) -> str:
     return text.strip()
 
 
-def expand_alias_variants(normalized_title: str) -> set[str]:
-    """Generate common alias variations from a normalized title string."""
-    variants = set()
-    if " and " in normalized_title:
-        variants.add(normalized_title.replace(" and ", " & "))
-    if " & " in normalized_title:
-        variants.add(normalized_title.replace(" & ", " and "))
-    if " vs " in normalized_title:
-        variants.add(normalized_title.replace(" vs ", " versus "))
-    if " versus " in normalized_title:
-        variants.add(normalized_title.replace(" versus ", " vs "))
-    if " part " in normalized_title:
-        variants.add(normalized_title.replace(" part ", " pt "))
-    if " pt " in normalized_title:
-        variants.add(normalized_title.replace(" pt ", " part "))
-    if normalized_title.startswith("the "):
-        variants.add(normalized_title[4:])
-    return variants
-
-
-def build_match_targets(title: str, aliases=None) -> list[str]:
-    """Build normalized match targets using the title and optional aliases."""
-    targets = set()
-    base = normalize_title(title)
-    if base:
-        targets.add(base)
-        targets.update(expand_alias_variants(base))
-    if aliases:
-        for alias in aliases:
-            normalized_alias = normalize_title(alias)
-            if normalized_alias:
-                targets.add(normalized_alias)
-                targets.update(expand_alias_variants(normalized_alias))
-    return [target for target in targets if target]
-
-
-def build_query_variants(title: str, aliases=None) -> list[str]:
-    """Generate a small set of query variants to improve search coverage."""
-    variants = []
-    seen = set()
-
-    def add_variant(value: str):
-        if not value:
-            return
-        lowered = value.lower()
-        if lowered in seen:
-            return
-        seen.add(lowered)
-        variants.append(value)
-
-    add_variant(title)
-    if aliases:
-        for alias in aliases:
-            add_variant(alias)
-    normalized = normalize_title(title)
-    add_variant(normalized)
-    for alias_variant in expand_alias_variants(normalized):
-        add_variant(alias_variant)
-    return variants[:MAX_QUERY_VARIANTS]
-
-
 def category_display_label(category: str) -> str:
     meta = CATEGORY_META.get(category, CATEGORY_META[CATEGORY_MOVIE])
     return f"{meta['icon']} {meta['label']}"
-
-
-def has_keyword(text: str, keywords: set[str]) -> bool:
-    words = set(normalize_title(text).split())
-    return any(keyword in words for keyword in keywords)
-
-
-# Change 2: Replaced detect_content_category with detect_content_type (DDG-based)
 def detect_content_type(query: str) -> str:
     try:
         with DDGS() as ddgs:
-            results = list(
-                ddgs.text(
-                    f"{query} wikipedia",
-                    max_results=5,
-                )
-            )
+            results = fetch_ddgs_results(ddgs, f"{query} wikipedia", 5)
 
         text = " ".join(
             (
@@ -426,17 +323,14 @@ def detect_content_type(query: str) -> str:
             for r in results
         ).lower()
 
-        if "video game" in text:
-            return CATEGORY_GAME
+        if "tv series" in text or "television series" in text:
+            return CATEGORY_TV
 
         if "anime" in text:
             return CATEGORY_ANIME
 
-        if "tv series" in text:
-            return CATEGORY_TV
-
-        if "television series" in text:
-            return CATEGORY_TV
+        if "video game" in text:
+            return CATEGORY_GAME
 
         if "season" in text:
             return CATEGORY_TV
@@ -447,78 +341,16 @@ def detect_content_type(query: str) -> str:
     return CATEGORY_MOVIE
 
 
-def build_category_query_variants(title: str, aliases, category: str) -> list[str]:
-    """Add category-aware query hints while keeping existing variant limits."""
-    base_variants = build_query_variants(title, aliases)
-    if not base_variants:
-        return []
-    category_hints = {
-        CATEGORY_MOVIE: ["movie", "film"],
-        CATEGORY_TV: ["tv series", "season"],
-        CATEGORY_ANIME: ["anime", "episode"],
-        CATEGORY_GAME: ["game", "pc game"],
-    }
-    hint_values = category_hints.get(category, [])
-    variants = list(base_variants)
-    for hint in hint_values:
-        if len(variants) >= MAX_QUERY_VARIANTS:
-            break
-        hinted = f"{title} {hint}".strip()
-        if hinted.lower() not in {v.lower() for v in variants}:
-            variants.append(hinted)
-    return variants[:MAX_QUERY_VARIANTS]
-
-
 def get_category_cache_prefix(category: str) -> str:
     return f"{CACHE_PREFIX_MOVIE}:{category}"
 
 
-def choose_active_category(
-    raw_title: str,
-    tmdb_info: dict[str, Any] | None,
-    forced_category: str | None,
-    category_results: dict[str, dict[str, str]],
-) -> str:
-    if forced_category in CATEGORY_META:
-        return forced_category
-    preferred = detect_content_type(raw_title)
-    if category_results.get(preferred):
-        return preferred
-    for category in SEARCH_CATEGORIES:
-        if category_results.get(category):
-            return category
-    return preferred
-
-
-def resolve_cached_category_results(cached_payload: Any) -> dict[str, str]:
+def resolve_cached_category_results(cached_payload: Any) -> Dict[str, str]:
     if is_empty_cache(cached_payload):
         return {}
     if isinstance(cached_payload, dict):
         return cached_payload
     return {}
-
-
-# --------------------------------------------------
-# Load sites from sites.json
-# --------------------------------------------------
-def load_sites(category=None):
-    try:
-        with open("sites.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if category:
-            return data.get(category, [])
-
-        all_sites = []
-
-        for category_sites in data.values():
-            all_sites.extend(category_sites)
-
-        return all_sites
-
-    except Exception:
-        logger.exception("Failed to load sites.json")
-        return []
 
 
 # --------------------------------------------------
@@ -580,6 +412,7 @@ def get_tmdb_info(title: str):
             "year": (best.get("release_date") or best.get("first_air_date") or "")[:4],
             "rating": best.get("vote_average"),
             "overview": best.get("overview"),
+            "tmdb_id": tmdb_id,
             "poster": (
                 f"https://image.tmdb.org/t/p/w500{best['poster_path']}"
                 if best.get("poster_path")
@@ -602,151 +435,159 @@ def get_tmdb_info(title: str):
 # --------------------------------------------------
 # Search helpers
 # --------------------------------------------------
-def score_search_result(match_targets, result) -> float:
-    """Score a search result against match targets (0.0-1.0)."""
-    if not match_targets:
-        return 0
-    href = result.get("href") or result.get("url") or ""
-    slug = urlparse(href).path if href else ""
-    slug = re.sub(r"[-_/]+", " ", slug)
-    candidate_parts = [
-        result.get("title", ""),
-        result.get("body", ""),
-        slug,
+def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[str, Any]]:
+    """Return a list of DDG results, handling None responses safely."""
+    try:
+        results = ddgs.text(query, max_results=max_results)
+    except Exception:
+        # DDGS can raise a variety of network/runtime errors; treat failures as empty.
+        logger.exception("DDG search failed for query: %s", query)
+        return []
+    return list(results or [])
+
+
+def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
+    site_domain = urlparse(site).netloc.replace("www.", "")
+    if not site_domain:
+        return None
+    queries = [
+        f'"{title}" site:{site_domain}',
+        f"{title} site:{site_domain}",
     ]
-    candidate_text = " ".join(part for part in candidate_parts if part)
-    candidate_normalized = normalize_title(candidate_text)
-    if len(candidate_normalized) > MAX_CANDIDATE_LENGTH:
-        truncated = candidate_normalized[:MAX_CANDIDATE_LENGTH]
-        candidate_normalized = truncated.rsplit(" ", 1)[0] or truncated
-    best_score = 0
-    for target in match_targets:
-        if not target:
-            continue
-        if target in candidate_normalized:
-            best_score = max(best_score, 0.85)
-        ratio = SequenceMatcher(None, target, candidate_normalized).ratio()
-        best_score = max(best_score, ratio)
-    return best_score
-
-
-def search_site(
-    title: str,
-    site_url: str,
-    match_targets: list[str] | None = None,
-    query_variants: list[str] | None = None,
-) -> str | None:
-    domain = urlparse(site_url).netloc.replace("www.", "")
-    if not domain:
-        return None
-    match_targets = match_targets or build_match_targets(title)
-    query_variants = query_variants or build_query_variants(title)
-    best_url = None
-    best_score = 0
     try:
         with DDGS() as ddgs:
-            for query_variant in query_variants:
-                query = f'{query_variant} site:{domain}'
-                results = ddgs.text(query, max_results=MAX_SEARCH_RESULTS)
-                for result in results:
-                    href = result.get("href") or result.get("url")
-                    if not href or domain not in href:
-                        continue
-                    score = score_search_result(match_targets, result)
-                    if score > best_score:
-                        best_score = score
-                        best_url = href
-                if best_score >= GOOD_MATCH_SCORE:
-                    break
-    except Exception:
-        logger.exception("Search failed for %s on %s", title, domain)
-        return None
-    if best_score < MIN_MATCH_SCORE:
-        return None
-    return best_url
-
-
-def search_movie(
-    title: str,
-    aliases: list[str] | None = None,
-    query_variants: list[str] | None = None,
-):
-    sites = load_sites()
-    if not sites:
-        return {}
-    match_targets = build_match_targets(title, aliases)
-    query_variants = query_variants or build_query_variants(title, aliases)
-    found = {}
-    for site in sites:
-        result = search_site(title, site, match_targets, query_variants)
-        if result:
-            domain = urlparse(site).netloc.replace("www.", "")
-            found[domain] = result
-    return found
-
-
-# Change 3: New fast category-aware search function
-def search_category_sites(title: str, category: str) -> dict[str, str]:
-    sites = load_sites(category)
-
-    found = {}
-
-    try:
-        with DDGS() as ddgs:
-
-            search_query = (
-                f'"{title}" movie'
-                if category == CATEGORY_MOVIE
-                else f'"{title}"'
-            )
-
-            results = ddgs.text(
-                search_query,
-                max_results=100,
-            )
-
-            for item in results:
-
-                href = item.get("href")
-
-                if not href:
-                    continue
-
-                domain = (
-                    urlparse(href)
-                    .netloc
-                    .replace("www.", "")
+            for query in queries:
+                logger.info("DDG category search query: %s", query)
+                results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
+                logger.info(
+                    "DDG category search returned %d results",
+                    len(results),
                 )
-
-                for site in sites:
-
-                    site_domain = (
-                        urlparse(site)
-                        .netloc
-                        .replace("www.", "")
-                    )
-
+                for item in results:
+                    href = item.get("href") or item.get("url")
+                    if not href:
+                        continue
+                    domain = urlparse(href).netloc.replace("www.", "")
                     if site_domain in domain:
-
-                        found[site_domain] = href
-                        break
-
+                        return site_domain, href
     except Exception:
-        logger.exception("Search failed")
+        logger.exception("Search failed for %s", site_domain)
+    return None
 
+
+def search_category_sites(title: str, category: str) -> Dict[str, str]:
+    sites = load_category_sites().get(category, [])
+    logger.info("Category=%s Sites count=%s", category, len(sites))
+
+    found = {}
+
+    if not sites:
+        return found
+
+    max_workers = min(8, len(sites))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(search_category_site, title, site)
+            for site in sites
+        ]
+        for future in as_completed(futures):
+            result = future.result()
+            if not result:
+                continue
+            site_domain, href = result
+            found[site_domain] = href
+
+    logger.info("Found %d site results for %s", len(found), title)
     return found
 
 
-def search_ott(title: str, aliases: list[str] | None = None):
-    countries = ["DE", "US", "GB", "IN"]
-    match_targets = build_match_targets(title, aliases)
-    query_variants = build_query_variants(title, aliases)
+def normalize_provider_name(provider_name: str) -> str:
+    """Normalize provider names for TMDB matching by stripping non-alphanumerics."""
+    return re.sub(r"[^a-z0-9]+", "", provider_name.lower())
+
+
+PROVIDER_ALIASES = {
+    "primevideo": {"amazonprimevideo", "primevideo"},
+    "disneyplus": {"disneyplus", "disneyplushotstar", "hotstar"},
+    "max": {"hbomax", "max"},
+}
+
+
+def provider_is_available(normalized_short: str, normalized_names: Set[str]) -> bool:
+    if not normalized_short or not normalized_names:
+        return False
+    if normalized_short in normalized_names:
+        return True
+    alias_names = PROVIDER_ALIASES.get(normalized_short, set())
+    return bool(alias_names.intersection(normalized_names))
+
+
+def get_tmdb_watch_providers(tmdb_id: int, media_type: str) -> Dict[str, Any]:
+    if not TMDB_API_KEY or not tmdb_id or media_type not in SUPPORTED_TMDB_MEDIA_TYPES:
+        return {}
+    url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/watch/providers"
+    try:
+        response = requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("results", {}) if isinstance(payload, dict) else {}
+    except Exception:
+        logger.exception("TMDB watch provider lookup failed for %s", tmdb_id)
+        return {}
+
+
+def extract_provider_names(country_data: Dict[str, Any]) -> List[str]:
+    """Extract TMDB watch provider names from supported offer types."""
+    names = []
+    for key in ("flatrate", "ads", "free", "rent", "buy"):
+        entries = country_data.get(key) or []
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("provider_name"):
+                names.append(entry["provider_name"])
+    return names
+
+
+def build_empty_ott_results() -> Dict[str, List[Dict[str, Any]]]:
+    results = {}
+    for country_code, providers in OTT_SITES.items():
+        results[country_code] = [
+            build_ott_provider_result(country_code, provider_name, None)
+            for provider_name in providers
+        ]
+    return results
+
+
+def search_ott(
+    title: str,
+    tmdb_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    info = tmdb_info if tmdb_info is not None else get_tmdb_info(title)
+    if info is None:
+        return build_empty_ott_results()
+    tmdb_id = info.get("tmdb_id")
+    media_type = info.get("media_type")
+    if not tmdb_id or media_type not in SUPPORTED_TMDB_MEDIA_TYPES:
+        return build_empty_ott_results()
+
+    tmdb_results = get_tmdb_watch_providers(tmdb_id, media_type)
     found = {}
-    for country in countries:
-        found[country] = []
-        for name, site in OTT_SITES[country].items():
-            result = search_site(title, site, match_targets, query_variants)
-            found[country].append(build_ott_provider_result(country, name, result))
+    for country_code, providers in OTT_SITES.items():
+        country_data = tmdb_results.get(country_code, {}) if tmdb_results else {}
+        provider_names = extract_provider_names(country_data)
+        normalized_names = {
+            normalize_provider_name(name) for name in provider_names if name
+        }
+        found[country_code] = []
+        for provider_name, site in providers.items():
+            short_name = shorten_ott_provider_name(provider_name, country_code)
+            normalized_short = normalize_provider_name(short_name)
+            available = provider_is_available(normalized_short, normalized_names)
+            url = site if available else None
+            found[country_code].append(
+                build_ott_provider_result(country_code, provider_name, url)
+            )
     return found
 
 
@@ -812,14 +653,6 @@ async def safe_telegram_call(action: Awaitable[Any], description: str) -> Any:
     return None
 
 
-def get_aliases_for_title(
-    context: ContextTypes.DEFAULT_TYPE,
-    normalized_title: str,
-) -> list[str]:
-    """Fetch stored aliases for a normalized title."""
-    return context.user_data.get("aliases", {}).get(normalized_title, [])
-
-
 def shorten_ott_provider_name(provider_name: str, country_code: str) -> str:
     """Return a compact provider label without the trailing country name."""
     country_name = COUNTRY_INFO.get(country_code, {}).get("name", "")
@@ -839,8 +672,8 @@ def shorten_ott_provider_name(provider_name: str, country_code: str) -> str:
 def build_ott_provider_result(
     country_code: str,
     provider_name: str,
-    url: str | None,
-) -> dict[str, Any]:
+    url: Optional[str],
+) -> Dict[str, Any]:
     """Build a provider result entry with display name and availability metadata."""
     return {
         "name": provider_name,
@@ -851,7 +684,7 @@ def build_ott_provider_result(
     }
 
 
-def format_ott_text(title: str, ott_results: dict) -> str:
+def format_ott_text(title: str, ott_results: Dict[str, List[Dict[str, Any]]]) -> str:
     """Format OTT availability grouped by country with flags and status."""
     summary = (
         "✅ Available on tracked platforms"
@@ -871,7 +704,7 @@ def format_ott_text(title: str, ott_results: dict) -> str:
     return "\n".join(lines).strip()
 
 
-def build_ott_keyboard(ott_results: dict) -> InlineKeyboardMarkup:
+def build_ott_keyboard(ott_results: Dict[str, List[Dict[str, Any]]]) -> InlineKeyboardMarkup:
     """Create buttons for available OTT providers with country flags."""
     keyboard = []
     for country_code, providers in ott_results.items():
@@ -888,7 +721,7 @@ def build_ott_keyboard(ott_results: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def has_ott_availability(ott_results: dict) -> bool:
+def has_ott_availability(ott_results: Dict[str, List[Dict[str, Any]]]) -> bool:
     """Return True when at least one OTT provider is available."""
     return any(
         provider["available"]
@@ -897,7 +730,7 @@ def has_ott_availability(ott_results: dict) -> bool:
     )
 
 
-def format_season_label(season: dict[str, Any]) -> str:
+def format_season_label(season: Dict[str, Any]) -> str:
     """Build a compact UI label for one season."""
     season_number = season.get("season_number")
     if season_number is None:
@@ -908,7 +741,7 @@ def format_season_label(season: dict[str, Any]) -> str:
     return f"📺 Season {season_number}"
 
 
-def format_episode_guide_text(title: str, seasons: list[dict[str, Any]]) -> str:
+def format_episode_guide_text(title: str, seasons: List[Dict[str, Any]]) -> str:
     """Create grouped season guide text for TV series."""
     lines = [f"📚 Episode Guide for {title}", ""]
     if not seasons:
@@ -926,7 +759,7 @@ def format_episode_guide_text(title: str, seasons: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_episode_guide_keyboard(seasons: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def build_episode_guide_keyboard(seasons: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     """Build season buttons in a cleaner two-column UI."""
     keyboard = []
     row = []
@@ -989,12 +822,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------
 async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        with open("sites.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-
         text = "🌐 Configured Sites\n\n"
-
-        for category, sites in data.items():
+        sites_by_category = load_category_sites()
+        for category, sites in sites_by_category.items():
             text += f"📂 {category.upper()} ({len(sites)})\n"
 
             for site in sites:
@@ -1006,7 +836,9 @@ async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
 
     except Exception:
-        await update.message.reply_text("❌ Could not load sites.json")
+        await update.message.reply_text(
+            "❌ Could not load configured sites. Please verify sites.json exists and is valid."
+        )
 
 # --------------------------------------------------
 # Search commands
@@ -1017,7 +849,7 @@ def get_command_query(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def build_results_caption(
     raw_title: str,
-    info: dict[str, Any] | None,
+    info: Optional[Dict[str, Any]],
     category: str,
 ) -> str:
     category_label = category_display_label(category)
@@ -1027,8 +859,10 @@ def build_results_caption(
             caption += f" ({info['year']})"
         caption += "</b>\n"
         caption += f"🧭 Category: {category_label}\n"
-        if info["rating"]:
-            caption += f"⭐ {info['rating']:.1f}/10\n"
+        rating = info.get("rating")
+        # TMDB ratings are expected on a 0-10 scale.
+        if isinstance(rating, (int, float)) and 0 <= rating <= MAX_TMDB_RATING:
+            caption += f"⭐ {rating:.1f}/{MAX_TMDB_RATING}\n"
         if info["overview"]:
             overview = info["overview"]
             if len(overview) > MAX_OVERVIEW_LENGTH:
@@ -1047,7 +881,7 @@ async def execute_search(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     raw_title: str,
-    forced_category: str | None = None,
+    forced_category: Optional[str] = None,
 ):
     if not update.message:
         return
@@ -1059,7 +893,7 @@ async def execute_search(
 
     try:
         parsed = parse_advanced_query(raw_title)
-        info = get_tmdb_info(parsed["query"])
+        info = await asyncio.to_thread(get_tmdb_info, parsed["query"])
         title = info["title"] if info else raw_title
         aliases = info.get("aliases", []) if info else []
         is_tv = bool(info and info.get("media_type") == "tv")
@@ -1079,11 +913,28 @@ async def execute_search(
             elif info.get("media_type") == "movie":
                 detected_category = CATEGORY_MOVIE
             else:
-                detected_category = detect_content_type(raw_title)
+                detected_category = await asyncio.to_thread(
+                    detect_content_type,
+                    raw_title,
+                )
         else:
-            detected_category = detect_content_type(raw_title)
+            detected_category = await asyncio.to_thread(
+                detect_content_type,
+                raw_title,
+            )
 
-        results = search_category_sites(title, detected_category)
+        cache_key = make_cache_key(get_category_cache_prefix(detected_category), title)
+        cached = get_cached(cache_key) if cache_key else None
+        if cached is not None:
+            results = resolve_cached_category_results(cached)
+        else:
+            results = await asyncio.to_thread(
+                search_category_sites,
+                title,
+                detected_category,
+            )
+            if cache_key:
+                save_cache(cache_key, results or CACHE_EMPTY_MARKER)
 
         if not results:
             message = f'❌ "{raw_title}" was not found on any configured sites.'
@@ -1098,25 +949,23 @@ async def execute_search(
 
         caption = build_results_caption(raw_title, info, detected_category)
 
-        # Store pagination state
         all_results = list(results.items())
         normalized_title = normalize_title(title)
         context.user_data["results"] = all_results
-        # Change 5: simplified category_results storage
         context.user_data["category_results"] = {
             detected_category: results
         }
         context.user_data["category_pages"] = {
             category: 0 for category in SEARCH_CATEGORIES
         }
-        # Change 6: no cache keys to track
-        context.user_data["category_cache_keys"] = {}
+        context.user_data["category_cache_keys"] = (
+            {detected_category: cache_key} if cache_key else {}
+        )
         context.user_data["current_title"] = title
         context.user_data["raw_title"] = raw_title
         context.user_data["current_tmdb_info"] = info
         context.user_data["current_title_key"] = normalized_title
-        # Change 6: no current cache key
-        context.user_data["current_cache_key"] = None
+        context.user_data["current_cache_key"] = cache_key
         context.user_data["current_cache_prefix"] = get_category_cache_prefix(detected_category)
         context.user_data["current_category"] = detected_category
         context.user_data["page"] = 0
@@ -1285,7 +1134,7 @@ def set_category_page(context: ContextTypes.DEFAULT_TYPE, category: str, page: i
 def get_cached_results_for_category(
     context: ContextTypes.DEFAULT_TYPE,
     category: str,
-) -> dict[str, str]:
+) -> Dict[str, str]:
     title = context.user_data.get("current_title", "")
     if not title:
         return {}
@@ -1302,7 +1151,7 @@ def get_cached_results_for_category(
 def get_results_for_category(
     context: ContextTypes.DEFAULT_TYPE,
     category: str,
-) -> dict[str, str]:
+) -> Dict[str, str]:
     category_results = context.user_data.setdefault("category_results", {})
     results = category_results.get(category)
     if results is not None:
@@ -1414,7 +1263,29 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if category not in category_results_store or not category_results_store[category]:
                 title = context.user_data.get("current_title", "")
                 if title:
-                    new_results = search_category_sites(title, category)
+                    category_cache_keys = context.user_data.setdefault(
+                        "category_cache_keys",
+                        {},
+                    )
+                    cache_key = category_cache_keys.get(category)
+                    if not cache_key:
+                        cache_key = make_cache_key(
+                            get_category_cache_prefix(category),
+                            title,
+                        )
+                        if cache_key:
+                            category_cache_keys[category] = cache_key
+                    cached = get_cached(cache_key) if cache_key else None
+                    if cached is not None:
+                        new_results = resolve_cached_category_results(cached)
+                    else:
+                        new_results = await asyncio.to_thread(
+                            search_category_sites,
+                            title,
+                            category,
+                        )
+                        if cache_key:
+                            save_cache(cache_key, new_results or CACHE_EMPTY_MARKER)
                     category_results_store[category] = new_results
                     if not new_results:
                         await safe_telegram_call(
@@ -1556,8 +1427,13 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if cached is not None:
                     results = cached
                 else:
-                    aliases = get_aliases_for_title(context, normalized_title)
-                    results = search_ott(title, aliases=aliases)
+                    current_title_key = context.user_data.get("current_title_key")
+                    tmdb_info = (
+                        context.user_data.get("current_tmdb_info")
+                        if current_title_key == normalized_title
+                        else None
+                    )
+                    results = await asyncio.to_thread(search_ott, title, tmdb_info)
                     if cache_key:
                         save_cache(cache_key, results)
                 ott_cache[normalized_title] = results
