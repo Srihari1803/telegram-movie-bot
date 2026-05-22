@@ -762,23 +762,47 @@ def search_movie(
 # Change 3: New fast category-aware search function
 def search_category_sites(title: str, category: str) -> dict[str, str]:
     sites = CATEGORY_SITES.get(category, [])
+
     found = {}
 
     try:
         with DDGS() as ddgs:
-            for site in sites:
-                domain = urlparse(site).netloc
 
-                results = ddgs.text(
-                    f'"{title}" site:{domain}',
-                    max_results=5,
+            search_query = (
+                f'"{title}" movie'
+                if category == CATEGORY_MOVIE
+                else f'"{title}"'
+            )
+
+            results = ddgs.text(
+                search_query,
+                max_results=100,
+            )
+
+            for item in results:
+
+                href = item.get("href")
+
+                if not href:
+                    continue
+
+                domain = (
+                    urlparse(href)
+                    .netloc
+                    .replace("www.", "")
                 )
 
-                for item in results:
-                    href = item.get("href")
+                for site in sites:
 
-                    if href:
-                        found[domain] = href
+                    site_domain = (
+                        urlparse(site)
+                        .netloc
+                        .replace("www.", "")
+                    )
+
+                    if site_domain in domain:
+
+                        found[site_domain] = href
                         break
 
     except Exception:
