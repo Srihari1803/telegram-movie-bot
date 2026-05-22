@@ -137,6 +137,39 @@ COUNTRY_INFO = {
     "IN": {"flag": "🇮🇳", "name": "India"},
 }
 
+# Change 1: Category-specific site lists
+MOVIE_SITES = [
+    "https://lookmovie2.to",
+    "https://hurawatch.art",
+    "https://ww8.123moviesfree.net",
+    "https://flixhqz.com",
+]
+
+TV_SITES = [
+    "https://goku-tv.pics",
+    "https://watchseries.bar",
+    "https://hurawatch.art",
+]
+
+ANIME_SITES = [
+    "https://gogoanime.by",
+    "https://animeheaven.me",
+    "https://animefreak.to",
+]
+
+GAME_SITES = [
+    "https://fitgirl-repacks.site",
+    "https://dodi-repacks.site",
+    "https://steamrip.com",
+]
+
+CATEGORY_SITES = {
+    CATEGORY_MOVIE: MOVIE_SITES,
+    CATEGORY_TV: TV_SITES,
+    CATEGORY_ANIME: ANIME_SITES,
+    CATEGORY_GAME: GAME_SITES,
+}
+
 
 # --------------------------------------------------
 # Database helpers
@@ -329,7 +362,7 @@ def normalize_title(title: str) -> str:
         return ""
     text = title.lower()
     text = text.replace("&", " and ")
-    text = re.sub(r"[’']", "", text)
+    text = re.sub(r"['']", "", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
@@ -406,35 +439,44 @@ def has_keyword(text: str, keywords: set[str]) -> bool:
     return any(keyword in words for keyword in keywords)
 
 
-def detect_content_category(
-    title: str,
-    tmdb_info: dict[str, Any] | None,
-    forced_category: str | None = None,
-) -> str:
-    """Detect the best category among movie, tv, anime, and game."""
-    if forced_category in CATEGORY_META:
-        return forced_category
+# Change 2: Replaced detect_content_category with detect_content_type (DDG-based)
+def detect_content_type(query: str) -> str:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
 
-    if has_keyword(title, GAME_KEYWORDS):
-        return CATEGORY_GAME
+        text = " ".join(
+            (
+                r.get("title", "")
+                + " "
+                + r.get("body", "")
+            )
+            for r in results
+        ).lower()
 
-    if has_keyword(title, ANIME_KEYWORDS):
-        return CATEGORY_ANIME
+        if "video game" in text:
+            return CATEGORY_GAME
 
-    if tmdb_info:
-        media_type = tmdb_info.get("media_type")
-        genre_ids = tmdb_info.get("genre_ids") or []
-        original_language = str(tmdb_info.get("original_language") or "").lower()
-        origin_country = tmdb_info.get("origin_country") or []
-        is_anime = 16 in genre_ids and (
-            original_language == "ja" or "JP" in origin_country
-        )
-        if is_anime:
+        if "anime" in text:
             return CATEGORY_ANIME
-        if media_type == "tv":
+
+        if "tv series" in text:
             return CATEGORY_TV
-        if media_type == "movie":
+
+        if "television series" in text:
+            return CATEGORY_TV
+
+        if "season 1" in text:
+            return CATEGORY_TV
+
+        if "film" in text:
             return CATEGORY_MOVIE
+
+        if "movie" in text:
+            return CATEGORY_MOVIE
+
+    except Exception:
+        logger.exception("Category detection failed")
 
     return CATEGORY_MOVIE
 
@@ -473,7 +515,7 @@ def choose_active_category(
 ) -> str:
     if forced_category in CATEGORY_META:
         return forced_category
-    preferred = detect_content_category(raw_title, tmdb_info, forced_category)
+    preferred = detect_content_type(raw_title)
     if category_results.get(preferred):
         return preferred
     for category in SEARCH_CATEGORIES:
@@ -488,37 +530,6 @@ def resolve_cached_category_results(cached_payload: Any) -> dict[str, str]:
     if isinstance(cached_payload, dict):
         return cached_payload
     return {}
-
-
-def search_all_categories(
-    title: str,
-    raw_title: str,
-    aliases: list[str] | None = None,
-) -> tuple[dict[str, dict[str, str]], dict[str, str | None]]:
-    all_results: dict[str, dict[str, str]] = {}
-    cache_keys: dict[str, str | None] = {}
-    for category in SEARCH_CATEGORIES:
-        cache_prefix = get_category_cache_prefix(category)
-        cached_results, cache_key = get_cached_for_titles(cache_prefix, [title, raw_title])
-        if cached_results is not None:
-            all_results[category] = resolve_cached_category_results(cached_results)
-            cache_keys[category] = cache_key
-            continue
-        variants = build_category_query_variants(title, aliases, category)
-        category_results = search_movie(
-            title,
-            aliases=aliases,
-            query_variants=variants,
-        )
-        cache_key = make_cache_key(cache_prefix, title)
-        if cache_key:
-            save_cache(
-                cache_key,
-                category_results if category_results else CACHE_EMPTY_MARKER,
-            )
-        all_results[category] = category_results
-        cache_keys[category] = cache_key
-    return all_results, cache_keys
 
 
 # --------------------------------------------------
@@ -706,6 +717,47 @@ def search_movie(
         if result:
             domain = urlparse(site).netloc.replace("www.", "")
             found[domain] = result
+    return found
+
+
+# Change 3: New fast category-aware search function
+def search_category_sites(title: str, category: str) -> dict[str, str]:
+    sites = CATEGORY_SITES.get(category, [])
+
+    domains = []
+    for site in sites:
+        domains.append(
+            f"site:{urlparse(site).netloc}"
+        )
+
+    query = f'"{title}" ({" OR ".join(domains)})'
+
+    found = {}
+
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(
+                query,
+                max_results=20,
+            )
+
+            for item in results:
+                href = item.get("href")
+
+                if not href:
+                    continue
+
+                domain = (
+                    urlparse(href)
+                    .netloc
+                    .replace("www.", "")
+                )
+
+                found[domain] = href
+
+    except Exception:
+        logger.exception("Search failed")
+
     return found
 
 
@@ -1031,18 +1083,12 @@ async def execute_search(
                 season for season in info["seasons"]
                 if isinstance(season, dict) and season.get("season_number") is not None
             ]
-        category_results, category_cache_keys = search_all_categories(
-            title,
-            raw_title,
-            aliases=aliases,
-        )
-        detected_category = choose_active_category(
-            raw_title,
-            info,
-            forced_category,
-            category_results,
-        )
-        results = category_results.get(detected_category, {})
+
+        # Changes 4, 5, 6: Use detect_content_type + search_category_sites;
+        # remove search_all_categories; simplify context storage
+        detected_category = forced_category if forced_category in CATEGORY_META else detect_content_type(raw_title)
+
+        results = search_category_sites(title, detected_category)
 
         if not results:
             message = f'❌ "{raw_title}" was not found on any configured sites.'
@@ -1061,16 +1107,21 @@ async def execute_search(
         all_results = list(results.items())
         normalized_title = normalize_title(title)
         context.user_data["results"] = all_results
-        context.user_data["category_results"] = category_results
+        # Change 5: simplified category_results storage
+        context.user_data["category_results"] = {
+            detected_category: results
+        }
         context.user_data["category_pages"] = {
             category: 0 for category in SEARCH_CATEGORIES
         }
-        context.user_data["category_cache_keys"] = category_cache_keys
+        # Change 6: no cache keys to track
+        context.user_data["category_cache_keys"] = {}
         context.user_data["current_title"] = title
         context.user_data["raw_title"] = raw_title
         context.user_data["current_tmdb_info"] = info
         context.user_data["current_title_key"] = normalized_title
-        context.user_data["current_cache_key"] = category_cache_keys.get(detected_category)
+        # Change 6: no current cache key
+        context.user_data["current_cache_key"] = None
         context.user_data["current_cache_prefix"] = get_category_cache_prefix(detected_category)
         context.user_data["current_category"] = detected_category
         context.user_data["page"] = 0
@@ -1362,6 +1413,14 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "category switch invalid",
                 )
                 return
+
+            # If results for this category not yet fetched, search now
+            category_results_store = context.user_data.setdefault("category_results", {})
+            if category not in category_results_store or not category_results_store[category]:
+                title = context.user_data.get("current_title", "")
+                if title:
+                    new_results = search_category_sites(title, category)
+                    category_results_store[category] = new_results
 
             set_active_category(context, category)
             current_title = context.user_data.get("current_title", "")
