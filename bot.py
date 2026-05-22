@@ -142,27 +142,67 @@ MOVIE_SITES = [
     "https://lookmovie2.to",
     "https://hurawatch.art",
     "https://ww8.123moviesfree.net",
+    "https://new1.hdhub4u.limo",
+    "https://desicinemas.to",
+    "https://uhdmovies.pink",
+    "https://moviesmod.farm",
+    "https://ww25.soap2day.day",
+    "https://themoviesflix.moe",
+    "https://mayamovie.org",
+    "https://putlocker-hd.xyz",
+    "https://cataz.my",
+    "https://guideflix.to",
+    "https://filmslook.com",
+    "https://solarmoviesz.com",
     "https://flixhqz.com",
+    "https://movie4k.sx",
+    "https://yomovies.courses",
+    "https://cinemalux.skin",
+    "https://todaypk.beauty",
+    "https://vegamovies.diamonds"
 ]
 
 TV_SITES = [
     "https://goku-tv.pics",
     "https://watchseries.bar",
+    "https://newprimewire.cc",
+    "https://hurawatch.cx",
     "https://hurawatch.art",
+    "https://flixhqz.com",
+    "https://ww25.soap2day.day",
+    "https://lookmovie2.to",
+    "https://ww19.myasiantv.es"
 ]
 
 ANIME_SITES = [
+    "https://animeflix.dad",
+    "https://9anime.digital",
+    "https://aniwaves.ru",
     "https://gogoanime.by",
+    "https://anitaku.com.ro",
     "https://animeheaven.me",
+    "https://animixplay.com.ro",
+    "https://kickassanime.com.es",
     "https://animefreak.to",
+    "https://animedao.in",
+    "https://animesuge.cz"
 ]
 
 GAME_SITES = [
     "https://fitgirl-repacks.site",
     "https://dodi-repacks.site",
-    "https://steamrip.com",
+    "https://steamunlocked.net",
+    "https://oceanofgames.com",
+    "https://igg-games.com",
+    "https://gamesdrive.net",
+    "https://pcgamestorrents.com",
+    "https://repack-games.com",
+    "https://crohasit.net",
+    "https://apunkagames.net",
+    "https://gload.to",
+    "https://elamigos.site",
+    "https://steamrip.com"
 ]
-
 CATEGORY_SITES = {
     CATEGORY_MOVIE: MOVIE_SITES,
     CATEGORY_TV: TV_SITES,
@@ -443,7 +483,12 @@ def has_keyword(text: str, keywords: set[str]) -> bool:
 def detect_content_type(query: str) -> str:
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
+            results = list(
+                ddgs.text(
+                    f"{query} wikipedia",
+                    max_results=5,
+                )
+            )
 
         text = " ".join(
             (
@@ -466,14 +511,8 @@ def detect_content_type(query: str) -> str:
         if "television series" in text:
             return CATEGORY_TV
 
-        if "season 1" in text:
+        if "season" in text:
             return CATEGORY_TV
-
-        if "film" in text:
-            return CATEGORY_MOVIE
-
-        if "movie" in text:
-            return CATEGORY_MOVIE
 
     except Exception:
         logger.exception("Category detection failed")
@@ -723,37 +762,24 @@ def search_movie(
 # Change 3: New fast category-aware search function
 def search_category_sites(title: str, category: str) -> dict[str, str]:
     sites = CATEGORY_SITES.get(category, [])
-
-    domains = []
-    for site in sites:
-        domains.append(
-            f"site:{urlparse(site).netloc}"
-        )
-
-    query = f'"{title}" ({" OR ".join(domains)})'
-
     found = {}
 
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(
-                query,
-                max_results=20,
-            )
+            for site in sites:
+                domain = urlparse(site).netloc
 
-            for item in results:
-                href = item.get("href")
-
-                if not href:
-                    continue
-
-                domain = (
-                    urlparse(href)
-                    .netloc
-                    .replace("www.", "")
+                results = ddgs.text(
+                    f'"{title}" site:{domain}',
+                    max_results=5,
                 )
 
-                found[domain] = href
+                for item in results:
+                    href = item.get("href")
+
+                    if href:
+                        found[domain] = href
+                        break
 
     except Exception:
         logger.exception("Search failed")
@@ -1084,9 +1110,18 @@ async def execute_search(
                 if isinstance(season, dict) and season.get("season_number") is not None
             ]
 
-        # Changes 4, 5, 6: Use detect_content_type + search_category_sites;
-        # remove search_all_categories; simplify context storage
-        detected_category = forced_category if forced_category in CATEGORY_META else detect_content_type(raw_title)
+        # Use TMDB media_type first, fall back to DDG detection
+        if forced_category in CATEGORY_META:
+            detected_category = forced_category
+        elif info:
+            if info.get("media_type") == "tv":
+                detected_category = CATEGORY_TV
+            elif info.get("media_type") == "movie":
+                detected_category = CATEGORY_MOVIE
+            else:
+                detected_category = detect_content_type(raw_title)
+        else:
+            detected_category = detect_content_type(raw_title)
 
         results = search_category_sites(title, detected_category)
 
@@ -1421,6 +1456,15 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if title:
                     new_results = search_category_sites(title, category)
                     category_results_store[category] = new_results
+                    if not new_results:
+                        await safe_telegram_call(
+                            query.answer(
+                                text="No results found in this category",
+                                show_alert=False,
+                            ),
+                            "category switch no results",
+                        )
+                        return
 
             set_active_category(context, category)
             current_title = context.user_data.get("current_title", "")
