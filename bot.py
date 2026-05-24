@@ -17,6 +17,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 from ddgs import DDGS
+from supabase import create_client
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -37,6 +38,13 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
 
 # ─── File paths ─────────────────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
