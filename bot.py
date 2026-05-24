@@ -223,27 +223,26 @@ def init_db() -> None:
 
 
 def save_history(user_id: int, title: str) -> None:
-    with db_connection(commit=True) as conn:
-        conn.execute(
-            "INSERT INTO history (user_id, title) VALUES (?, ?)",
-            (user_id, title),
-        )
+    supabase.table("history").insert({
+        "user_id": user_id,
+        "title": title
+    }).execute()
 
 
 def get_history(user_id: int) -> List[Tuple[str, str]]:
-    with db_connection(commit=True) as conn:
-        conn.execute(
-            "DELETE FROM history WHERE searched_at < datetime('now', '-4 days')"
-        )
-        rows = conn.execute("""
-            SELECT title, MAX(searched_at)
-            FROM   history
-            WHERE  user_id = ?
-            GROUP BY title
-            ORDER BY MAX(searched_at) DESC
-            LIMIT 10
-        """, (user_id,))
-        return rows.fetchall()
+    response = (
+        supabase.table("history")
+        .select("title,searched_at")
+        .eq("user_id", user_id)
+        .order("searched_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+
+    return [
+        (row["title"], row["searched_at"])
+        for row in response.data
+    ]
 
 
 def add_favorite(user_id: int, title: str) -> None:
