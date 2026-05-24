@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,6 +49,9 @@ DB_BUSY_TIMEOUT_MS = 5000
 
 CACHE_DURATION = 86400          # 24 hours
 CACHE_CLEANUP_INTERVAL = 3600   # 1 hour
+
+# Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
+_cleanup_thread: Optional[threading.Thread] = None
 RESULTS_PER_PAGE = 5
 MAX_SEARCH_RESULTS = 8
 MAX_OVERVIEW_LENGTH = 400
@@ -1590,12 +1594,47 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ════════════════════════════════════════════════════════════════════════════
 
 async def cleanup_cache_job(_: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic cache cleanup driven by JobQueue (preferred path)."""
     try:
         removed = await asyncio.to_thread(cleanup_cache)
         if removed:
             logger.info("Cache cleanup: removed %d expired entries", removed)
     except Exception:
         logger.exception("Cache cleanup job failed")
+
+
+def _fallback_cleanup_loop() -> None:
+    """
+    Background daemon thread used when python-telegram-bot[job-queue] is not
+    installed.  Runs cleanup_cache() every CACHE_CLEANUP_INTERVAL seconds.
+    The thread is daemonised so it never prevents process exit.
+    """
+    logger.info(
+        "Fallback cache-cleanup thread started (interval=%ds)", CACHE_CLEANUP_INTERVAL
+    )
+    while True:
+        time.sleep(CACHE_CLEANUP_INTERVAL)
+        try:
+            removed = cleanup_cache()
+            if removed:
+                logger.info(
+                    "Fallback cleanup: removed %d expired cache entries", removed
+                )
+        except Exception:
+            logger.exception("Fallback cleanup iteration failed")
+
+
+def start_fallback_cleanup_thread() -> None:
+    """Start the daemon cleanup thread exactly once."""
+    global _cleanup_thread
+    if _cleanup_thread is not None and _cleanup_thread.is_alive():
+        return
+    _cleanup_thread = threading.Thread(
+        target=_fallback_cleanup_loop,
+        name="cache-cleanup",
+        daemon=True,
+    )
+    _cleanup_thread.start()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1640,11 +1679,20 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_title))
     app.add_handler(CallbackQueryHandler(favorite_callback))
 
-    app.job_queue.run_repeating(
-        cleanup_cache_job,
-        interval=CACHE_CLEANUP_INTERVAL,
-        first=CACHE_CLEANUP_INTERVAL,
-    )
+    # ── JobQueue is optional (needs python-telegram-bot[job-queue]) ──────────
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            cleanup_cache_job,
+            interval=CACHE_CLEANUP_INTERVAL,
+            first=CACHE_CLEANUP_INTERVAL,
+        )
+        logger.info("JobQueue cache-cleanup scheduled every %ds", CACHE_CLEANUP_INTERVAL)
+    else:
+        logger.warning(
+            "JobQueue not available (install python-telegram-bot[job-queue] for "
+            "scheduled cleanup). Falling back to daemon thread."
+        )
+        start_fallback_cleanup_thread()
 
     logger.info("Bot is polling...")
     app.run_polling(drop_pending_updates=True)
