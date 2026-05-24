@@ -247,29 +247,31 @@ def get_history(user_id: int) -> List[Tuple[str, str]]:
 
 
 def add_favorite(user_id: int, title: str) -> None:
-    with db_connection(commit=True) as conn:
-        conn.execute(
-            "INSERT INTO favorites (user_id, title) VALUES (?, ?)",
-            (user_id, title),
-        )
+    supabase.table("favorites").insert({
+        "user_id": user_id,
+        "title": title
+    }).execute()
 
 
 def remove_favorite(user_id: int, title: str) -> None:
-    with db_connection(commit=True) as conn:
-        conn.execute(
-            "DELETE FROM favorites WHERE user_id = ? AND title = ?",
-            (user_id, title),
-        )
+    (
+        supabase.table("favorites")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("title", title)
+        .execute()
+    )
 
 
 def get_favorites(user_id: int) -> List[Tuple[str]]:
-    with db_connection() as conn:
-        rows = conn.execute(
-            "SELECT title FROM favorites WHERE user_id = ? ORDER BY id DESC",
-            (user_id,),
-        )
-        return rows.fetchall()
+    response = (
+        supabase.table("favorites")
+        .select("title")
+        .eq("user_id", user_id)
+        .execute()
+    )
 
+    return [(row["title"],) for row in response.data]
 
 # ─── Cache helpers ────────────────────────────────────────────────────────────
 
