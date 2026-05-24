@@ -282,33 +282,39 @@ def make_cache_key(prefix: str, query: str) -> Optional[str]:
 
 
 def get_cached(cache_key: str) -> Optional[Any]:
-    with db_connection(commit=True) as conn:
-        row = conn.execute(
-            "SELECT data, created_at FROM cache WHERE query = ?",
-            (cache_key,),
-        ).fetchone()
-        if not row:
-            return None
-        data, created_at = row
-        if not isinstance(created_at, (int, float)):
-            conn.execute("DELETE FROM cache WHERE query = ?", (cache_key,))
-            return None
-        if time.time() - int(created_at) > CACHE_DURATION:
-            conn.execute("DELETE FROM cache WHERE query = ?", (cache_key,))
-            return None
-        try:
-            return json.loads(data)
-        except (json.JSONDecodeError, TypeError):
-            conn.execute("DELETE FROM cache WHERE query = ?", (cache_key,))
-            return None
+    response = (
+        supabase.table("cache")
+        .select("data,created_at")
+        .eq("query", cache_key)
+        .execute()
+    )
+
+    if not response.data:
+        return None
+
+    row = response.data[0]
+
+    if time.time() - int(row["created_at"]) > CACHE_DURATION:
+        (
+            supabase.table("cache")
+            .delete()
+            .eq("query", cache_key)
+            .execute()
+        )
+        return None
+
+    try:
+        return json.loads(row["data"])
+    except Exception:
+        return None
 
 
 def save_cache(cache_key: str, data: Any) -> None:
-    with db_connection(commit=True) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO cache (query, data, created_at) VALUES (?, ?, ?)",
-            (cache_key, json.dumps(data), int(time.time())),
-        )
+    supabase.table("cache").upsert({
+        "query": cache_key,
+        "data": json.dumps(data),
+        "created_at": int(time.time())
+    }).execute()
 
 
 def cache_empty_result(cache_key: str) -> None:
