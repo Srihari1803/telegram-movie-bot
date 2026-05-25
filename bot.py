@@ -322,13 +322,16 @@ def cache_empty_result(cache_key: str) -> None:
 
 
 def cleanup_cache() -> int:
-    """Delete all expired cache entries; return count removed."""
     cutoff = int(time.time()) - CACHE_DURATION
-    with db_connection(commit=True) as conn:
-        cursor = conn.execute(
-            "DELETE FROM cache WHERE created_at < ?", (cutoff,)
-        )
-        return cursor.rowcount
+
+    response = (
+        supabase.table("cache")
+        .delete()
+        .lt("created_at", cutoff)
+        .execute()
+    )
+
+    return len(response.data) if response.data else 0
 
 
 def is_empty_cache(cached: Any) -> bool:
