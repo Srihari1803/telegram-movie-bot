@@ -143,6 +143,29 @@ OTT_SITES: Dict[str, Dict[str, str]] = {
         "Disney+ Hotstar":      "https://www.hotstar.com/in",
         "Prime Video India":    "https://www.primevideo.com",
     },
+    "CA": {
+        "Netflix Canada": "https://www.netflix.com/ca/",
+        "Disney+ Canada": "https://www.disneyplus.com/en-ca",
+        "Prime Video Canada": "https://www.primevideo.com",
+    },
+
+    "AU": {
+        "Netflix Australia": "https://www.netflix.com/au/",
+        "Disney+ Australia": "https://www.disneyplus.com/en-au",
+        "Prime Video Australia": "https://www.primevideo.com",
+    },
+
+    "FR": {
+        "Netflix France": "https://www.netflix.com/fr/",
+        "Disney+ France": "https://www.disneyplus.com/fr-fr",
+        "Prime Video France": "https://www.primevideo.com",
+    },
+
+    "JP": {
+        "Netflix Japan": "https://www.netflix.com/jp/",
+        "Disney+ Japan": "https://www.disneyplus.com/ja-jp",
+        "Prime Video Japan": "https://www.primevideo.com",
+    }
 }
 
 COUNTRY_INFO: Dict[str, Dict[str, str]] = {
@@ -150,11 +173,14 @@ COUNTRY_INFO: Dict[str, Dict[str, str]] = {
     "US": {"flag": "🇺🇸", "name": "USA"},
     "GB": {"flag": "🇬🇧", "name": "UK"},
     "IN": {"flag": "🇮🇳", "name": "India"},
+    "AU": {"flag": "🇮🇳", "name": "Australia"},
+    "FR": {"flag": "🇮🇳", "name": "France"},
+    "JP": {"flag": "🇮🇳", "name": "Japan"},
 }
 
 PROVIDER_ALIASES: Dict[str, Set[str]] = {
     "primevideo": {"amazonprimevideo", "primevideo"},
-    "disneyplus": {"disneyplus", "disneyplushotstar", "hotstar"},
+    "disneyplus": {"disneyplus", "disneyplushotstar", "hotstar", "jiohotstar"},
     "max":        {"hbomax", "max"},
 }
 
