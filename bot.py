@@ -55,8 +55,8 @@ SITES_FILE = os.path.join(_BASE_DIR, "sites.json")
 DB_TIMEOUT = 30
 DB_BUSY_TIMEOUT_MS = 5000
 
-CACHE_DURATION = 86400          # 24 hours
-CACHE_CLEANUP_INTERVAL = 3600   # 1 hour
+CACHE_DURATION = 604800          # 7 days
+CACHE_CLEANUP_INTERVAL = 86400   # 24 hour
 
 # Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
 _cleanup_thread: Optional[threading.Thread] = None
@@ -855,7 +855,7 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
         return {}
 
     found: Dict[str, str] = {}
-    max_workers = min(8, len(sites))
+    max_workers = min(20, len(sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
             executor.submit(search_category_site, title, site): site
