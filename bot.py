@@ -802,6 +802,11 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
             for query in queries:
                 logger.debug("DDG query: %s", query)
                 results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
+                logger.info(f"QUERY: {query}")
+                logger.info(f"RESULTS COUNT: {len(results)}")
+
+                for r in results[:3]:
+                    logger.info(f"RESULT: {r}")
                 logger.debug("DDG returned %d results for %s", len(results), site_domain)
                 for item in results:
                     href = item.get("href") or item.get("url")
