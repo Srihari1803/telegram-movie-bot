@@ -494,6 +494,12 @@ def load_category_sites() -> Dict[str, List[str]]:
     try:
         with open(SITES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+            
+        logger.info(f"Movie sites loaded: {len(data.get('movie', []))}")
+        logger.info(f"TV sites loaded: {len(data.get('tv', []))}")
+        logger.info(f"Anime sites loaded: {len(data.get('anime', []))}")
+        logger.info(f"Game sites loaded: {len(data.get('game', []))}")
+        
     except FileNotFoundError:
         logger.error(
             "sites.json not found at %s. "
