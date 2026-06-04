@@ -31,7 +31,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 
 # ─── Environment ────────────────────────────────────────────────────────────
 load_dotenv()
@@ -41,10 +41,9 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+SUPABASE_CLIENT: Optional[Any] = None
+ADMIN_IDS: Set[int] = set()
+START_TIME = time.time()
 
 # ─── File paths ─────────────────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +54,8 @@ SITES_FILE = os.path.join(_BASE_DIR, "sites.json")
 DB_TIMEOUT = 30
 DB_BUSY_TIMEOUT_MS = 5000
 
-CACHE_DURATION = 604800          # 7 days
+CACHE_DURATION_SUCCESS = 604800  # 7 days
+CACHE_DURATION_EMPTY = 3600      # 1 hour
 CACHE_CLEANUP_INTERVAL = 86400   # 24 hour
 
 # Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
@@ -69,11 +69,18 @@ TOKEN_CACHE_LIMIT = 25
 HTTP_TIMEOUT: Tuple[int, int] = (5, 15)   # (connect, read)
 HTTP_POOL_SIZE = 20
 
+DDGS_MAX_WORKERS = 5  # keep low to reduce DDGS rate limiting
+DDGS_RETRY_COUNT = 3
+DDGS_BACKOFF_BASE = 1.0
+DDGS_MAX_BACKOFF = 8.0
+DDGS_TEST_QUERY = "example.com"  # stable domain for DDGS healthcheck
+
 CACHE_PREFIX_MOVIE = "movie"
 CACHE_PREFIX_OTT = "ott"
 CACHE_PREFIX_TMDB = "tmdb"
 CACHE_PREFIX_DETECT = "detect"
 CACHE_EMPTY_MARKER: Dict[str, bool] = {"_empty": True}
+EMPTY_CACHE_PAYLOAD = json.dumps(CACHE_EMPTY_MARKER)  # keep in sync with marker
 
 SUPPORTED_TMDB_MEDIA_TYPES: Set[str] = {"movie", "tv"}
 MAX_TMDB_RATING = 10
@@ -100,6 +107,50 @@ SEARCH_CATEGORIES: List[str] = [
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
+
+SITES_CACHE: Optional[Dict[str, List[str]]] = None
+SITES_CACHE_LOCK = threading.Lock()
+_DDGS_LOCAL = threading.local()
+
+def get_supabase() -> Any:
+    if SUPABASE_CLIENT is None:
+        raise RuntimeError("Supabase client is not initialized.")
+    return SUPABASE_CLIENT
+
+
+def load_admin_ids() -> Set[int]:
+    raw = os.getenv("ADMIN_IDS", "")
+    ids: Set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning("Invalid ADMIN_IDS entry: %s", part)
+    return ids
+
+
+def get_ddgs_client() -> DDGS:
+    client = getattr(_DDGS_LOCAL, "client", None)
+    if client is None:
+        client = DDGS()
+        _DDGS_LOCAL.client = client
+    return client
+
+
+def reset_ddgs_client() -> None:
+    client = getattr(_DDGS_LOCAL, "client", None)
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logger.debug("DDGS client close failed", exc_info=True)
+    _DDGS_LOCAL.client = None
 
 # ─── HTTP session (shared, with connection pooling) ─────────────────────────
 _http_adapter = HTTPAdapter(
@@ -249,7 +300,7 @@ def init_db() -> None:
 
 
 def save_history(user_id: int, title: str) -> None:
-    supabase.table("history").insert({
+    get_supabase().table("history").insert({
         "user_id": user_id,
         "title": title
     }).execute()
@@ -257,7 +308,7 @@ def save_history(user_id: int, title: str) -> None:
 
 def get_history(user_id: int) -> List[Tuple[str, str]]:
     response = (
-        supabase.table("history")
+        get_supabase().table("history")
         .select("title,searched_at")
         .eq("user_id", user_id)
         .order("searched_at", desc=True)
@@ -272,7 +323,7 @@ def get_history(user_id: int) -> List[Tuple[str, str]]:
 
 
 def add_favorite(user_id: int, title: str) -> None:
-    supabase.table("favorites").insert({
+    get_supabase().table("favorites").insert({
         "user_id": user_id,
         "title": title
     }).execute()
@@ -280,7 +331,7 @@ def add_favorite(user_id: int, title: str) -> None:
 
 def remove_favorite(user_id: int, title: str) -> None:
     (
-        supabase.table("favorites")
+        get_supabase().table("favorites")
         .delete()
         .eq("user_id", user_id)
         .eq("title", title)
@@ -290,7 +341,7 @@ def remove_favorite(user_id: int, title: str) -> None:
 
 def get_favorites(user_id: int) -> List[Tuple[str]]:
     response = (
-        supabase.table("favorites")
+        get_supabase().table("favorites")
         .select("title")
         .eq("user_id", user_id)
         .execute()
@@ -309,34 +360,43 @@ def make_cache_key(prefix: str, query: str) -> Optional[str]:
 
 def get_cached(cache_key: str) -> Optional[Any]:
     response = (
-        supabase.table("cache")
+        get_supabase().table("cache")
         .select("data,created_at")
         .eq("query", cache_key)
         .execute()
     )
 
     if not response.data:
+        logger.info("Cache MISS: %s", cache_key)
         return None
 
     row = response.data[0]
+    try:
+        payload = json.loads(row["data"])
+    except Exception:
+        logger.exception("Cache decode failed for key=%s", cache_key)
+        logger.info("Cache MISS: %s", cache_key)
+        return None
 
-    if time.time() - int(row["created_at"]) > CACHE_DURATION:
+    created_at = int(row["created_at"])
+    ttl = CACHE_DURATION_EMPTY if is_empty_cache(payload) else CACHE_DURATION_SUCCESS
+    logger.debug("Cache TTL for %s: %ds", cache_key, ttl)
+    if time.time() - created_at > ttl:
         (
-            supabase.table("cache")
+            get_supabase().table("cache")
             .delete()
             .eq("query", cache_key)
             .execute()
         )
+        logger.info("Cache MISS: %s", cache_key)
         return None
 
-    try:
-        return json.loads(row["data"])
-    except Exception:
-        return None
+    logger.info("Cache HIT: %s", cache_key)
+    return payload
 
 
 def save_cache(cache_key: str, data: Any) -> None:
-    supabase.table("cache").upsert({
+    get_supabase().table("cache").upsert({
         "query": cache_key,
         "data": json.dumps(data),
         "created_at": int(time.time())
@@ -348,16 +408,28 @@ def cache_empty_result(cache_key: str) -> None:
 
 
 def cleanup_cache() -> int:
-    cutoff = int(time.time()) - CACHE_DURATION
+    removed_total = 0
+    cutoff_success = int(time.time()) - CACHE_DURATION_SUCCESS
 
     response = (
-        supabase.table("cache")
+        get_supabase().table("cache")
         .delete()
-        .lt("created_at", cutoff)
+        .lt("created_at", cutoff_success)
         .execute()
     )
+    removed_total += len(response.data) if response.data else 0
 
-    return len(response.data) if response.data else 0
+    cutoff_empty = int(time.time()) - CACHE_DURATION_EMPTY
+    response = (
+        get_supabase().table("cache")
+        .delete()
+        .eq("data", EMPTY_CACHE_PAYLOAD)
+        .lt("created_at", cutoff_empty)
+        .execute()
+    )
+    removed_total += len(response.data) if response.data else 0
+
+    return removed_total
 
 
 def is_empty_cache(cached: Any) -> bool:
@@ -418,7 +490,7 @@ def reset_search_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     for key in (
         "results", "category_results", "category_pages", "category_cache_keys",
         "current_title", "raw_title", "current_tmdb_info", "current_title_key",
-        "current_category", "current_title_token", "main_caption",
+        "current_category", "current_year", "current_title_token", "main_caption",
         "current_is_tv", "current_seasons", "ott_results",
     ):
         context.user_data.pop(key, None)
@@ -436,6 +508,39 @@ def normalize_title(title: str) -> str:
     text = re.sub(r"['']", "", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_title_tokens(title: str) -> List[str]:
+    normalized = normalize_title(title)
+    if not normalized:
+        return []
+    stop_words = {"the", "a", "an"}
+    return [token for token in normalized.split() if token and token not in stop_words]
+
+
+def fuzzy_title_match(reference: str, candidate: str) -> bool:
+    ref_tokens = normalize_title_tokens(reference)
+    if not ref_tokens:
+        return False
+    return fuzzy_title_match_with_tokens(ref_tokens, set(ref_tokens), candidate)
+
+
+def fuzzy_title_match_with_tokens(
+    ref_tokens: List[str],
+    ref_set: Set[str],
+    candidate: str,
+) -> bool:
+    cand_tokens = normalize_title_tokens(candidate)
+    if not ref_tokens or not cand_tokens:
+        return False
+    cand_set = set(cand_tokens)
+    if ref_tokens == cand_tokens:
+        return True
+    if ref_set.issubset(cand_set) or cand_set.issubset(ref_set):
+        return True
+    overlap = len(ref_set.intersection(cand_set))
+    ratio = overlap / max(len(ref_set), len(cand_set))
+    return ratio >= 0.8
 
 
 def normalize_site_domain(site: str) -> str:
@@ -481,44 +586,59 @@ def get_category_cache_prefix(category: str) -> str:
     return f"{CACHE_PREFIX_MOVIE}:{category}"
 
 
+def empty_sites_cache() -> Dict[str, List[str]]:
+    return {
+        CATEGORY_MOVIE: [],
+        CATEGORY_TV: [],
+        CATEGORY_ANIME: [],
+        CATEGORY_GAME: [],
+    }
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Sites loading
 # ════════════════════════════════════════════════════════════════════════════
 
-def load_category_sites() -> Dict[str, List[str]]:
+def load_category_sites(refresh: bool = False) -> Dict[str, List[str]]:
     """
     Load sites.json from the same directory as bot.py.
     Returns a dict keyed by category; each value is a deduplicated list of URLs.
     Logs a clear error if the file is missing or malformed.
     """
-    try:
-        with open(SITES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            
-        logger.info(f"Movie sites loaded: {len(data.get('movie', []))}")
-        logger.info(f"TV sites loaded: {len(data.get('tv', []))}")
-        logger.info(f"Anime sites loaded: {len(data.get('anime', []))}")
-        logger.info(f"Game sites loaded: {len(data.get('game', []))}")
-        
-    except FileNotFoundError:
-        logger.error(
-            "sites.json not found at %s. "
-            "Create it next to bot.py. Working dir: %s | Files: %s",
-            SITES_FILE,
-            os.getcwd(),
-            os.listdir(os.getcwd()),
-        )
-        return {}
-    except json.JSONDecodeError:
-        logger.error("sites.json at %s contains invalid JSON.", SITES_FILE)
-        return {}
-    except Exception:
-        logger.exception("Failed to load sites.json from %s", SITES_FILE)
-        return {}
+    global SITES_CACHE
+    with SITES_CACHE_LOCK:
+        if SITES_CACHE is not None and not refresh:
+            return SITES_CACHE
+        try:
+            with open(SITES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            logger.info(f"Movie sites loaded: {len(data.get('movie', []))}")
+            logger.info(f"TV sites loaded: {len(data.get('tv', []))}")
+            logger.info(f"Anime sites loaded: {len(data.get('anime', []))}")
+            logger.info(f"Game sites loaded: {len(data.get('game', []))}")
+        except FileNotFoundError:
+            logger.error(
+                "sites.json not found at %s. "
+                "Create it next to bot.py. Working dir: %s | Files: %s",
+                SITES_FILE,
+                os.getcwd(),
+                os.listdir(os.getcwd()),
+            )
+            SITES_CACHE = empty_sites_cache()
+            return SITES_CACHE
+        except json.JSONDecodeError:
+            logger.error("sites.json at %s contains invalid JSON.", SITES_FILE)
+            SITES_CACHE = empty_sites_cache()
+            return SITES_CACHE
+        except Exception:
+            logger.exception("Failed to load sites.json from %s", SITES_FILE)
+            SITES_CACHE = empty_sites_cache()
+            return SITES_CACHE
 
-    if not isinstance(data, dict):
-        logger.error("sites.json must be a JSON object keyed by category.")
-        return {}
+        if not isinstance(data, dict):
+            logger.error("sites.json must be a JSON object keyed by category.")
+            SITES_CACHE = empty_sites_cache()
+            return SITES_CACHE
 
     def normalize_sites(entries: Any) -> List[str]:
         if not isinstance(entries, list):
@@ -534,19 +654,23 @@ def load_category_sites() -> Dict[str, List[str]]:
                 result.append(site)
         return result
 
-    loaded = {
-        CATEGORY_MOVIE: normalize_sites(data.get(CATEGORY_MOVIE, [])),
-        CATEGORY_TV:    normalize_sites(data.get(CATEGORY_TV,    [])),
-        CATEGORY_ANIME: normalize_sites(data.get(CATEGORY_ANIME, [])),
-        CATEGORY_GAME:  normalize_sites(data.get(CATEGORY_GAME,  [])),
-    }
-    total = sum(len(v) for v in loaded.values())
-    logger.info(
-        "Loaded sites.json: %d categories, %d sites total",
-        len(loaded),
-        total,
-    )
-    return loaded
+        loaded = {
+            CATEGORY_MOVIE: normalize_sites(data.get(CATEGORY_MOVIE, [])),
+            CATEGORY_TV:    normalize_sites(data.get(CATEGORY_TV,    [])),
+            CATEGORY_ANIME: normalize_sites(data.get(CATEGORY_ANIME, [])),
+            CATEGORY_GAME:  normalize_sites(data.get(CATEGORY_GAME,  [])),
+        }
+        total = sum(len(v) for v in loaded.values())
+        logger.info(
+            "Loaded sites.json: %d categories, %d sites total",
+            len(loaded),
+            total,
+        )
+        for category, sites in loaded.items():
+            if not sites:
+                logger.warning("No sites configured for category: %s", category)
+        SITES_CACHE = loaded
+        return loaded
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -554,13 +678,34 @@ def load_category_sites() -> Dict[str, List[str]]:
 # ════════════════════════════════════════════════════════════════════════════
 
 def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[str, Any]]:
-    """Materialise DDG results into a list; return [] on any failure."""
-    try:
-        raw = ddgs.text(query, max_results=max_results)
-        return list(raw or [])
-    except Exception:
-        logger.warning("DDG search failed for query: %s", query)
-        return []
+    """Materialise DDG results into a list with retries; return [] on failure."""
+    for attempt in range(1, DDGS_RETRY_COUNT + 1):
+        try:
+            raw = ddgs.text(query, max_results=max_results)
+            return list(raw or [])
+        except (requests.Timeout, TimeoutError):
+            logger.warning(
+                "DDG timeout (attempt %d/%d) for query: %s",
+                attempt,
+                DDGS_RETRY_COUNT,
+                query,
+            )
+        except Exception:
+            logger.exception(
+                "DDG search failed (attempt %d/%d) for query: %s",
+                attempt,
+                DDGS_RETRY_COUNT,
+                query,
+            )
+        if attempt < DDGS_RETRY_COUNT:
+            backoff = min(
+                DDGS_BACKOFF_BASE * (2 ** (attempt - 1)),
+                DDGS_MAX_BACKOFF,
+            )
+            logger.info("Retrying DDG search in %.1fs", backoff)
+            time.sleep(backoff)
+    reset_ddgs_client()
+    return []
 
 
 def detect_content_type(query: str) -> str:
@@ -569,8 +714,11 @@ def detect_content_type(query: str) -> str:
     TV show, anime, game, or movie. Defaults to CATEGORY_MOVIE on failure.
     """
     try:
-        with DDGS() as ddgs:
-            results = fetch_ddgs_results(ddgs, f"{query} wikipedia", 5)
+        ddgs = get_ddgs_client()
+        ddg_query = f"{query} wikipedia"
+        logger.info("Detecting category via DDG: %s", ddg_query)
+        results = fetch_ddgs_results(ddgs, ddg_query, 5)
+        logger.info("DDG results count: %d", len(results))
         text = " ".join(
             r.get("title", "") + " " + r.get("body", "")
             for r in results
@@ -816,7 +964,11 @@ def search_ott(
 # Site search (parallelised per-category)
 # ════════════════════════════════════════════════════════════════════════════
 
-def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
+def search_category_site(
+    title: str,
+    site: str,
+    query_title: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
     """
     Search a single site for *title*.
     Returns (domain, url) on success, None otherwise.
@@ -825,46 +977,86 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
     site_domain = normalize_site_domain(site)
     if not site_domain:
         return None
+    search_title = query_title or title
+    ref_tokens = normalize_title_tokens(title)
+    ref_set = set(ref_tokens)
     queries = [
-        f'"{title}" site:{site_domain}',
-        f"{title} site:{site_domain}",
+        f'"{search_title}" site:{site_domain}',
+        f"{search_title} site:{site_domain}",
     ]
     try:
-        with DDGS() as ddgs:
-            for query in queries:
-                logger.debug("DDG query: %s", query)
-                results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
-                logger.debug("DDG returned %d results for %s", len(results), site_domain)
-                for item in results:
-                    href = item.get("href") or item.get("url")
-                    if not href or not is_valid_http_url(href):
-                        continue
-                    if site_domain in normalize_site_domain(href):
-                        logger.info("Hit: %s → %s", site_domain, href)
-                        return site_domain, href
+        ddgs = get_ddgs_client()
+        logger.info("DDGS domain search: %s", site_domain)
+        for query in queries:
+            logger.info("DDGS query: %s", query)
+            results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
+            logger.info("DDGS results count: %d", len(results))
+            for item in results:
+                href = item.get("href") or item.get("url")
+                if not href or not is_valid_http_url(href):
+                    continue
+                href_domain = normalize_site_domain(href)
+                if not href_domain:
+                    continue
+                if not (site_domain in href_domain or href_domain in site_domain):
+                    continue
+                result_text = f"{item.get('title', '')} {item.get('body', '')}".strip()
+                if result_text and ref_tokens and not fuzzy_title_match_with_tokens(
+                    ref_tokens,
+                    ref_set,
+                    result_text,
+                ):
+                    logger.debug(
+                        "Skipping result due to title mismatch: %s",
+                        result_text,
+                    )
+                    continue
+                logger.info("DDGS selected URL: %s", href)
+                return site_domain, href
     except Exception:
         logger.exception("search_category_site failed: title=%s site=%s", title, site_domain)
     return None
 
 
-def search_category_sites(title: str, category: str) -> Dict[str, str]:
-    """
-    Search all sites for *category* in parallel using a thread pool.
-    A single failing worker does not abort the whole search.
-    Returns a dict of {domain: url}.
-    """
+def build_search_fallback_queries(
+    title: str,
+    category: str,
+    year: Optional[str] = None,
+) -> List[str]:
     if not title:
-        return {}
-    sites = load_category_sites().get(category, [])
-    logger.info("search_category_sites: category=%s sites=%d", category, len(sites))
-    if not sites:
-        return {}
+        return []
+    queries: List[str] = [title]
+    if year and year not in title:
+        queries.append(f"{title} {year}")
+    suffix = {
+        CATEGORY_MOVIE: "movie",
+        CATEGORY_TV: "tv series",
+        CATEGORY_ANIME: "anime",
+        CATEGORY_GAME: "game",
+    }.get(category)
+    if suffix:
+        queries.append(f"{title} {suffix}")
+    seen: Set[str] = set()
+    deduped = []
+    for entry in queries:
+        entry = entry.strip()
+        if not entry or entry in seen:
+            continue
+        seen.add(entry)
+        deduped.append(entry)
+    return deduped
 
+
+def _search_category_sites_for_query(
+    title: str,
+    query_title: str,
+    sites: List[str],
+) -> Dict[str, str]:
     found: Dict[str, str] = {}
-    max_workers = min(20, len(sites))
+    max_workers = min(DDGS_MAX_WORKERS, len(sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
-            executor.submit(search_category_site, title, site): site
+            executor.submit(search_category_site, title, site, query_title): site
             for site in sites
         }
         for future in as_completed(future_to_site):
@@ -872,7 +1064,6 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
             try:
                 result = future.result()
             except Exception:
-                # BUG FIX: individual worker failure must not crash the search
                 logger.exception(
                     "Worker failed for title=%s site=%s — skipping",
                     title,
@@ -882,8 +1073,48 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
             if result:
                 domain, href = result
                 found[domain] = href
+    return found
 
-    logger.info("search_category_sites: found %d results for %s", len(found), title)
+
+def search_category_sites(
+    title: str,
+    category: str,
+    year: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Search all sites for *category* in parallel using a thread pool.
+    A single failing worker does not abort the whole search.
+    Returns a dict of {domain: url}.
+    """
+    if not title:
+        return {}
+    sites = load_category_sites().get(category, [])
+    logger.info("Searching: %s", title)
+    logger.info("Category: %s", category)
+    logger.info("Sites count: %d", len(sites))
+    if not sites:
+        return {}
+
+    fallback_queries = build_search_fallback_queries(title, category, year)
+    found: Dict[str, str] = {}
+    for index, query_title in enumerate(fallback_queries):
+        if index == 0:
+            logger.info("Initial search attempt: %s", query_title)
+        else:
+            logger.info("Fallback search attempt: %s", query_title)
+        results = _search_category_sites_for_query(title, query_title, sites)
+        logger.info("Matches found: %d", len(results))
+        if results:
+            found = results
+            break
+
+    logger.info(
+        "Search completed | title=%s | category=%s | sites=%d | results=%d",
+        title,
+        category,
+        len(sites),
+        len(found),
+    )
     return found
 
 
@@ -1043,6 +1274,59 @@ async def safe_telegram_call(action: Awaitable[Any], description: str) -> Any:
     return None
 
 
+def is_admin_user(user_id: int) -> bool:
+    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
+
+
+def format_uptime(seconds: float) -> str:
+    remaining = int(seconds)
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, secs = divmod(remaining, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def get_cache_entry_count() -> int:
+    try:
+        response = get_supabase().table("cache").select("query", count="exact").execute()
+        count = getattr(response, "count", None)
+        if count is not None:
+            return int(count)
+        return len(response.data) if response.data else 0
+    except Exception:
+        logger.exception("Failed to fetch cache size")
+        return -1
+
+
+def check_supabase_connection() -> str:
+    try:
+        get_supabase().table("cache").select("query").limit(1).execute()
+        return "OK"
+    except Exception as exc:
+        logger.exception("Supabase connection check failed")
+        return f"Error: {exc}"
+
+
+def run_ddgs_healthcheck() -> str:
+    try:
+        ddgs = get_ddgs_client()
+        results = fetch_ddgs_results(ddgs, DDGS_TEST_QUERY, 1)
+        if results:
+            return f"OK ({len(results)} results)"
+        return "Warning: No results returned"
+    except Exception as exc:
+        logger.exception("DDGS healthcheck failed")
+        return f"Error: {exc}"
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Caption builder
 # ════════════════════════════════════════════════════════════════════════════
@@ -1134,7 +1418,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "   • /movie <title>\n"
         "   • /tv <title>\n"
         "   • /anime <title>\n"
-        "   • /game <title>\n\n"
+        "   • /game <title>\n"
+        "   • /debug (admin only)\n\n"
         "Examples:\n"
         "• Inception\n"
         "• /movie Interstellar\n"
@@ -1165,6 +1450,43 @@ async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Could not load configured sites.")
 
 
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    user_id = update.message.from_user.id
+    if not is_admin_user(user_id):
+        logger.warning("Unauthorized /debug attempt: user_id=%s", user_id)
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+
+    sites_by_cat = load_category_sites()
+    total_sites = sum(len(sites) for sites in sites_by_cat.values())
+    cache_size = await asyncio.to_thread(get_cache_entry_count)
+    category_cache = context.user_data.get("category_results", {})
+    category_cache_count = len(category_cache) if isinstance(category_cache, dict) else 0
+    ddgs_status = await asyncio.to_thread(run_ddgs_healthcheck)
+    supabase_status = await asyncio.to_thread(check_supabase_connection)
+    uptime = format_uptime(time.time() - START_TIME)
+
+    lines = [
+        "🛠 Debug Info",
+        (
+            "Sites loaded: "
+            f"{total_sites} "
+            f"(movie={len(sites_by_cat.get(CATEGORY_MOVIE, []))}, "
+            f"tv={len(sites_by_cat.get(CATEGORY_TV, []))}, "
+            f"anime={len(sites_by_cat.get(CATEGORY_ANIME, []))}, "
+            f"game={len(sites_by_cat.get(CATEGORY_GAME, []))})"
+        ),
+        f"Cache size: {cache_size if cache_size >= 0 else 'Unavailable'}",
+        f"Category cache count: {category_cache_count}",
+        f"DDGS test: {ddgs_status}",
+        f"Supabase: {supabase_status}",
+        f"Uptime: {uptime}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
 def get_command_query(context: ContextTypes.DEFAULT_TYPE) -> str:
     return " ".join(context.args).strip() if context.args else ""
 
@@ -1193,6 +1515,7 @@ async def execute_search(
         parsed = parse_advanced_query(raw_title)
         info = await asyncio.to_thread(get_tmdb_info, parsed["query"])
         title = (info.get("title") if info else None) or raw_title
+        year = (info.get("year") if info else None) or parsed.get("year")
         is_tv = bool(info and info.get("media_type") == "tv")
         seasons = [
             s for s in (info.get("seasons") or [])
@@ -1207,7 +1530,7 @@ async def execute_search(
         if cached is not None:
             results = resolve_cached_category_results(cached)
         else:
-            results = await asyncio.to_thread(search_category_sites, title, detected_category)
+            results = await asyncio.to_thread(search_category_sites, title, detected_category, year)
             if cache_key:
                 await asyncio.to_thread(save_cache, cache_key, results or CACHE_EMPTY_MARKER)
 
@@ -1235,6 +1558,7 @@ async def execute_search(
             "current_tmdb_info":    info,
             "current_title_key":    normalized_title,
             "current_category":     detected_category,
+            "current_year":         year,
             "current_title_token":  title_token,
             "main_caption":         caption,
             "current_is_tv":        is_tv,
@@ -1462,7 +1786,12 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if cached is not None:
                     new_results = resolve_cached_category_results(cached)
                 else:
-                    new_results = await asyncio.to_thread(search_category_sites, title, category)
+                    new_results = await asyncio.to_thread(
+                        search_category_sites,
+                        title,
+                        category,
+                        context.user_data.get("current_year"),
+                    )
                     if cache_key:
                         await asyncio.to_thread(
                             save_cache, cache_key, new_results or CACHE_EMPTY_MARKER
@@ -1699,16 +2028,36 @@ def main() -> None:
     logger.info("✅ Bot starting up...")
     logger.info("BOT_TOKEN present:    %s", bool(BOT_TOKEN))
     logger.info("TMDB_API_KEY present: %s", bool(TMDB_API_KEY))
+    logger.info("SUPABASE_URL present: %s", bool(SUPABASE_URL))
+    logger.info("SUPABASE_KEY present: %s", bool(SUPABASE_KEY))
     logger.info("Working directory:    %s", os.getcwd())
     logger.info("Bot script location:  %s", _BASE_DIR)
     logger.info("DB file:              %s", DB_FILE)
     logger.info("sites.json path:      %s", SITES_FILE)
     logger.info("sites.json exists:    %s", os.path.isfile(SITES_FILE))
 
+    global SUPABASE_CLIENT
+    global ADMIN_IDS
+
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing from environment / .env")
     if not TMDB_API_KEY:
         raise ValueError("TMDB_API_KEY is missing from environment / .env")
+    if not SUPABASE_URL:
+        raise ValueError("SUPABASE_URL is missing from environment / .env")
+    if not SUPABASE_KEY:
+        raise ValueError("SUPABASE_KEY is missing from environment / .env")
+
+    ADMIN_IDS = load_admin_ids()
+    if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS not configured; /debug will be disabled.")
+
+    SUPABASE_CLIENT = create_client(
+        SUPABASE_URL,
+        SUPABASE_KEY,
+    )
+
+    load_category_sites(refresh=True)
 
     init_db()
     removed = cleanup_cache()
@@ -1720,6 +2069,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("sites",     sites_command))
+    app.add_handler(CommandHandler("debug",     debug_command))
     app.add_handler(CommandHandler("movie",     movie_command))
     app.add_handler(CommandHandler("tv",        tv_command))
     app.add_handler(CommandHandler("anime",     anime_command))
@@ -1745,7 +2095,14 @@ def main() -> None:
         start_fallback_cleanup_thread()
 
     logger.info("Bot is polling...")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except Conflict as exc:
+        logger.warning(
+            "Another bot instance is already running with the same BOT_TOKEN."
+        )
+        logger.warning("Telegram polling conflict: %s", exc)
+        raise
 
 
 if __name__ == "__main__":
