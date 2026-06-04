@@ -1744,11 +1744,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
         main()
-
     except Exception:
         import traceback
         print("❌ Startup error:")
