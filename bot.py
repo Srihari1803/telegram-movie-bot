@@ -810,6 +810,7 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
                 logger.debug("DDG returned %d results for %s", len(results), site_domain)
                 for item in results:
                     href = item.get("href") or item.get("url")
+                    logger.info(f"FOUND URL: {href}")
                     if not href or not is_valid_http_url(href):
                         continue
                     if site_domain in normalize_site_domain(href):
