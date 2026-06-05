@@ -855,6 +855,7 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
                 continue
             if result:
                 domain, href = result
+                logger.info(f"SAVING: {domain} -> {href}")
                 found[domain] = href
 
     logger.info("search_category_sites: found %d results for %s", len(found), title)
