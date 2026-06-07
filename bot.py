@@ -1250,7 +1250,7 @@ async def execute_search(
                     context,
                     title,
                     detected_category,
-                    MAX_TOTAL_RESULTS
+                    results
                 )
             )
             
