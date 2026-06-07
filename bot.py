@@ -61,7 +61,7 @@ CACHE_CLEANUP_INTERVAL = 3600    # 1 hour
 # Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
 _cleanup_thread: Optional[threading.Thread] = None
 RESULTS_PER_PAGE = 5
-MAX_SEARCH_RESULTS = 10
+MAX_SEARCH_RESULTS = 50
 INITIAL_RESULTS = 5
 MAX_TOTAL_RESULTS = 100
 MAX_OVERVIEW_LENGTH = 400
@@ -867,12 +867,7 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
     )
     return found
     
-async def background_search_sites(
-    context,
-    title,
-    category,
-    existing_results
-):
+
     try:
         all_results = await asyncio.to_thread(
             search_category_sites,
