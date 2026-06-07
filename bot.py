@@ -785,7 +785,7 @@ def search_ott(
 # Site search (parallelised per-category)
 # ════════════════════════════════════════════════════════════════════════════
 
-def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
+def search_category_site(title: str, site: str, year: Optional[int] = None) -> Optional[Tuple[str, str]]:
     """
     Search a single site for *title*.
     Returns (domain, url) on success, None otherwise.
@@ -793,11 +793,14 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
     site_domain = normalize_site_domain(site)
     if not site_domain:
         return None
-    queries = [
+    queries = []
+    if year:
+        queries.append(f'"{title}" {year} site:{site_domain}')
+    queries.extend([
         f'"{title}" site:{site_domain}',
         f'{title} watch online site:{site_domain}',
         f'{title} streaming site:{site_domain}',
-    ]
+    ])
     try:
         with DDGS() as ddgs:
             for query in queries:
@@ -827,7 +830,7 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def search_category_sites(title: str, category: str) -> Dict[str, str]:
+def search_category_sites(title: str, category: str, year: Optional[int] = None) -> Dict[str, str]:
     """
     Search all sites for *category* in parallel using a thread pool.
     Returns a dict of {domain: url}.
@@ -843,7 +846,7 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
     max_workers = min(20, len(sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
-            executor.submit(search_category_site, title, site): site
+            executor.submit(search_category_site, title, site, year): site
             for site in sites
         }
         for future in as_completed(future_to_site):
@@ -1226,8 +1229,12 @@ async def execute_search(
         if cached is not None:
             results = resolve_cached_category_results(cached)
         else:
+            try:
+                year_int = int(info.get("year")) if info and info.get("year") else None
+            except (ValueError, TypeError):
+                year_int = None
             all_results = await asyncio.to_thread(
-                search_category_sites, title, detected_category
+                search_category_sites, title, detected_category, year_int
             )
             results = all_results
             logger.info("TOTAL RESULTS FOUND = %s", len(results))
@@ -1554,8 +1561,13 @@ async def favorite_callback(
                 if cached is not None:
                     new_results = resolve_cached_category_results(cached)
                 else:
+                    info = context.user_data.get("current_tmdb_info")
+                    try:
+                        year_int = int(info.get("year")) if info and info.get("year") else None
+                    except (ValueError, TypeError):
+                        year_int = None
                     new_results = await asyncio.to_thread(
-                        search_category_sites, title, category
+                        search_category_sites, title, category, year_int
                     )
                     if cache_key:
                         await asyncio.to_thread(
