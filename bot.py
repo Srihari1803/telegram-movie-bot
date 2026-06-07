@@ -1189,23 +1189,23 @@ async def execute_search(
         if not results:
             msg = f'❌ "{raw_title}" was not found on any configured sites.'
 
-    if info:
-        suggestions = []
+           if info:
+               suggestions = []
 
-        if info.get("title"):
-            suggestions.append(info["title"])
+               if info.get("title"):
+                   suggestions.append(info["title"])
 
-        for alias in info.get("aliases", []):
-            if alias not in suggestions:
-                suggestions.append(alias)
+              for alias in info.get("aliases", []):
+                  if alias not in suggestions:
+                      suggestions.append(alias)
 
-        if suggestions:
-            msg += "\n\n💡 Did you mean:\n"
-            msg += "\n".join(f"• {s}" for s in suggestions[:5])
-            if status:
-                await safe_telegram_call(status.edit_text(msg), "edit status empty")
-            else:
-                await safe_telegram_call(update.message.reply_text(msg), "send empty")
+          if suggestions:
+              msg += "\n\n💡 Did you mean:\n"
+              msg += "\n".join(f"• {s}" for s in suggestions[:5])
+          if status:
+              await safe_telegram_call(status.edit_text(msg), "edit status empty")
+          else:
+              await safe_telegram_call(update.message.reply_text(msg), "send empty")
             return
 
         caption = build_results_caption(raw_title, info, detected_category)
