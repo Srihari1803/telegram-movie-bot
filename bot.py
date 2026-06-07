@@ -1050,6 +1050,7 @@ def build_results_caption(
     raw_title: str,
     info: Optional[Dict[str, Any]],
     category: str,
+    search_time: float = 0,
 ) -> str:
     label = category_display_label(category)
     if info:
@@ -1070,6 +1071,7 @@ def build_results_caption(
             caption += f"\n{overview}\n"
     else:
         caption = f'🎬 <b>Results for "{raw_title}"</b>\n🧭 Category: {label}\n'
+    caption += "\n⏱ Search Time: {search_time}s"
     caption += "\n🔗 Select a source below:"
     return caption
 
@@ -1111,7 +1113,14 @@ def set_active_category(context: ContextTypes.DEFAULT_TYPE, category: str) -> No
     info = context.user_data.get("current_tmdb_info")
     context.user_data["results"] = all_results
     context.user_data["current_category"] = category
-    context.user_data["main_caption"] = build_results_caption(raw_title, info, category)
+    old_caption = context.user_data.get("main_caption")
+
+    if old_caption:
+        context.user_data["main_caption"] = old_caption
+    else:
+        context.user_data["main_caption"] = build_results_caption(
+            raw_title, info, category
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1255,11 +1264,13 @@ async def execute_search(
             return
 
         # ── Build and send results ────────────────────────────────────────────
-        caption = build_results_caption(raw_title, info, detected_category)
         elapsed = round(time.time() - search_start, 2)
-        caption += f"\n⏱ Search Time: {elapsed}s"
-        logger.info("SEARCH TIME = %s", elapsed)
-        logger.info("CAPTION = %s", caption)
+        caption = build_results_caption(
+            raw_title,
+            info,
+            detected_category,
+            elapsed
+        )
         all_results = list(results.items())
         normalized_title = normalize_title(title)
         title_token = build_title_token(title) or ""
