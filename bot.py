@@ -1258,6 +1258,8 @@ async def execute_search(
         caption = build_results_caption(raw_title, info, detected_category)
         elapsed = round(time.time() - search_start, 2)
         caption += f"\n⏱ Search Time: {elapsed}s"
+        logger.info("SEARCH TIME = %s", elapsed)
+        logger.info("CAPTION = %s", caption)
         all_results = list(results.items())
         normalized_title = normalize_title(title)
         title_token = build_title_token(title) or ""
