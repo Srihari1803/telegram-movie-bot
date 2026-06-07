@@ -63,6 +63,7 @@ _cleanup_thread: Optional[threading.Thread] = None
 RESULTS_PER_PAGE = 5
 MAX_SEARCH_RESULTS = 10
 INITIAL_RESULTS = 5
+MAX_TOTAL_RESULTS = 100
 MAX_OVERVIEW_LENGTH = 400
 MAX_TITLE_LENGTH = 120
 TOKEN_CACHE_LIMIT = 25
@@ -1249,7 +1250,7 @@ async def execute_search(
                     context,
                     title,
                     detected_category,
-                    results
+                    MAX_TOTAL_RESULTS
                 )
             )
             
