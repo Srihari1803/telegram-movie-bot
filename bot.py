@@ -55,8 +55,8 @@ SITES_FILE = os.path.join(_BASE_DIR, "sites.json")
 DB_TIMEOUT = 30
 DB_BUSY_TIMEOUT_MS = 5000
 
-CACHE_DURATION = 604800          # 24 hours
-CACHE_CLEANUP_INTERVAL = 3600   # 1 hour
+CACHE_DURATION = 604800          # 7 days
+CACHE_CLEANUP_INTERVAL = 3600    # 1 hour
 
 # Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
 _cleanup_thread: Optional[threading.Thread] = None
@@ -113,21 +113,21 @@ HTTP_SESSION.headers.update({"User-Agent": "MovieSearchBot/1.0"})
 
 # ─── Static UI data ─────────────────────────────────────────────────────────
 BUTTON_NAMES: Dict[str, str] = {
-    "lookmovie2.to":        "🎬 LookMovie",
-    "goku-tv.pics":         "🍿 GokuTV",
-    "hurawatch.art":        "📺 HuraWatch",
+    "lookmovie2.to":          "🎬 LookMovie",
+    "goku-tv.pics":           "🍿 GokuTV",
+    "hurawatch.art":          "📺 HuraWatch",
     "www8.123moviesfree.net": "🎥 123Movies",
-    "ww19.myasiantv.es":    "📺 MyAsianTV",
-    "desicinemas.to":       "🇮🇳 DesiCinema",
-    "uhdmovies.pink":       "💎 UHD Movies",
-    "moviesmod.farm":       "🎞 MoviesMod",
+    "ww19.myasiantv.es":      "📺 MyAsianTV",
+    "desicinemas.to":         "🇮🇳 DesiCinema",
+    "uhdmovies.pink":         "💎 UHD Movies",
+    "moviesmod.farm":         "🎞 MoviesMod",
 }
 
 OTT_SITES: Dict[str, Dict[str, str]] = {
     "DE": {
-        "Netflix Germany":      "https://www.netflix.com/de/",
-        "Disney+ Germany":      "https://www.disneyplus.com/de-de",
-        "Prime Video Germany":  "https://www.primevideo.com",
+        "Netflix Germany":     "https://www.netflix.com/de/",
+        "Disney+ Germany":     "https://www.disneyplus.com/de-de",
+        "Prime Video Germany": "https://www.primevideo.com",
     },
     "US": {
         "Netflix USA":  "https://www.netflix.com",
@@ -135,13 +135,13 @@ OTT_SITES: Dict[str, Dict[str, str]] = {
         "Max USA":      "https://www.max.com",
     },
     "GB": {
-        "Netflix UK":   "https://www.netflix.com/gb/",
-        "Disney+ UK":   "https://www.disneyplus.com/en-gb",
+        "Netflix UK":  "https://www.netflix.com/gb/",
+        "Disney+ UK":  "https://www.disneyplus.com/en-gb",
     },
     "IN": {
-        "Netflix India":        "https://www.netflix.com/in/",
-        "Disney+ Hotstar":      "https://www.hotstar.com/in",
-        "Prime Video India":    "https://www.primevideo.com",
+        "Netflix India":     "https://www.netflix.com/in/",
+        "Disney+ Hotstar":   "https://www.hotstar.com/in",
+        "Prime Video India": "https://www.primevideo.com",
     },
 }
 
@@ -225,7 +225,7 @@ def init_db() -> None:
 def save_history(user_id: int, title: str) -> None:
     supabase.table("history").insert({
         "user_id": user_id,
-        "title": title
+        "title": title,
     }).execute()
 
 
@@ -238,7 +238,6 @@ def get_history(user_id: int) -> List[Tuple[str, str]]:
         .limit(10)
         .execute()
     )
-
     return [
         (row["title"], row["searched_at"])
         for row in response.data
@@ -248,7 +247,7 @@ def get_history(user_id: int) -> List[Tuple[str, str]]:
 def add_favorite(user_id: int, title: str) -> None:
     supabase.table("favorites").insert({
         "user_id": user_id,
-        "title": title
+        "title": title,
     }).execute()
 
 
@@ -269,8 +268,8 @@ def get_favorites(user_id: int) -> List[Tuple[str]]:
         .eq("user_id", user_id)
         .execute()
     )
-
     return [(row["title"],) for row in response.data]
+
 
 # ─── Cache helpers ────────────────────────────────────────────────────────────
 
@@ -313,7 +312,7 @@ def save_cache(cache_key: str, data: Any) -> None:
     supabase.table("cache").upsert({
         "query": cache_key,
         "data": json.dumps(data),
-        "created_at": int(time.time())
+        "created_at": int(time.time()),
     }).execute()
 
 
@@ -323,14 +322,12 @@ def cache_empty_result(cache_key: str) -> None:
 
 def cleanup_cache() -> int:
     cutoff = int(time.time()) - CACHE_DURATION
-
     response = (
         supabase.table("cache")
         .delete()
         .lt("created_at", cutoff)
         .execute()
     )
-
     return len(response.data) if response.data else 0
 
 
@@ -370,7 +367,8 @@ def store_token(
     if not isinstance(store, OrderedDict):
         store = OrderedDict(store or {})
         context.user_data[bucket] = store
-    store.move_to_end(token) if token in store else None
+    if token in store:
+        store.move_to_end(token)
     store[token] = value
     while len(store) > max_entries:
         store.popitem(last=False)
@@ -463,7 +461,6 @@ def load_category_sites() -> Dict[str, List[str]]:
     """
     Load sites.json from the same directory as bot.py.
     Returns a dict keyed by category; each value is a deduplicated list of URLs.
-    Logs a clear error if the file is missing or malformed.
     """
     try:
         with open(SITES_FILE, "r", encoding="utf-8") as f:
@@ -544,7 +541,6 @@ def detect_content_type(query: str) -> str:
             for r in results
         ).lower()
 
-        # TV / anime / game checks ordered from most specific to least
         if "tv series" in text or "television series" in text:
             return CATEGORY_TV
         if "anime" in text:
@@ -578,7 +574,6 @@ async def resolve_detected_category(
 ) -> str:
     """
     Priority: forced_category → TMDB media_type → DDG-based detection.
-    Only calls DDG when TMDB gives no clear answer, saving a network round-trip.
     """
     if forced_category in CATEGORY_META:
         return forced_category
@@ -651,21 +646,21 @@ def get_tmdb_info(title: str) -> Optional[Dict[str, Any]]:
                 logger.exception("TMDB TV detail lookup failed for %s", title)
 
         info: Dict[str, Any] = {
-            "title":            best.get("title") or best.get("name") or title,
-            "year":             (best.get("release_date") or best.get("first_air_date") or "")[:4],
-            "rating":           best.get("vote_average"),
-            "overview":         best.get("overview"),
-            "tmdb_id":          tmdb_id,
-            "poster":           (
+            "title":             best.get("title") or best.get("name") or title,
+            "year":              (best.get("release_date") or best.get("first_air_date") or "")[:4],
+            "rating":            best.get("vote_average"),
+            "overview":          best.get("overview"),
+            "tmdb_id":           tmdb_id,
+            "poster":            (
                 f"https://image.tmdb.org/t/p/w500{best['poster_path']}"
                 if best.get("poster_path") else None
             ),
-            "aliases":          aliases,
-            "media_type":       media_type,
-            "seasons":          seasons,
-            "genre_ids":        best.get("genre_ids") or [],
+            "aliases":           aliases,
+            "media_type":        media_type,
+            "seasons":           seasons,
+            "genre_ids":         best.get("genre_ids") or [],
             "original_language": best.get("original_language"),
-            "origin_country":   origin_country,
+            "origin_country":    origin_country,
         }
         save_cache(cache_key, info)
         return info
@@ -773,9 +768,13 @@ def search_ott(
         found[country_code] = []
         for provider_name, site in providers.items():
             short_name = shorten_ott_provider_name(provider_name, country_code)
-            available = provider_is_available(normalize_provider_name(short_name), normalized_names)
+            available = provider_is_available(
+                normalize_provider_name(short_name), normalized_names
+            )
             found[country_code].append(
-                build_ott_provider_result(country_code, provider_name, site if available else None)
+                build_ott_provider_result(
+                    country_code, provider_name, site if available else None
+                )
             )
     return found
 
@@ -788,7 +787,6 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
     """
     Search a single site for *title*.
     Returns (domain, url) on success, None otherwise.
-    Two query variants are tried; the first good hit wins.
     """
     site_domain = normalize_site_domain(site)
     if not site_domain:
@@ -802,29 +800,29 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
             for query in queries:
                 logger.debug("DDG query: %s", query)
                 results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
-                logger.info(f"QUERY: {query}")
-                logger.info(f"RESULTS COUNT: {len(results)}")
-
+                logger.info("QUERY: %s", query)
+                logger.info("RESULTS COUNT: %d", len(results))
                 for r in results[:3]:
-                    logger.info(f"RESULT: {r}")
+                    logger.info("RESULT: %s", r)
                 logger.debug("DDG returned %d results for %s", len(results), site_domain)
                 for item in results:
                     href = item.get("href") or item.get("url")
-                    logger.info(f"FOUND URL: {href}")
+                    logger.info("FOUND URL: %s", href)
                     if not href or not is_valid_http_url(href):
                         continue
                     if site_domain in normalize_site_domain(href):
                         logger.info("Hit: %s → %s", site_domain, href)
                         return site_domain, href
     except Exception:
-        logger.exception("search_category_site failed: title=%s site=%s", title, site_domain)
+        logger.exception(
+            "search_category_site failed: title=%s site=%s", title, site_domain
+        )
     return None
 
 
 def search_category_sites(title: str, category: str) -> Dict[str, str]:
     """
     Search all sites for *category* in parallel using a thread pool.
-    A single failing worker does not abort the whole search.
     Returns a dict of {domain: url}.
     """
     if not title:
@@ -846,7 +844,6 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
             try:
                 result = future.result()
             except Exception:
-                # BUG FIX: individual worker failure must not crash the search
                 logger.exception(
                     "Worker failed for title=%s site=%s — skipping",
                     title,
@@ -855,10 +852,12 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
                 continue
             if result:
                 domain, href = result
-                logger.info(f"SAVING: {domain} -> {href}")
+                logger.info("SAVING: %s -> %s", domain, href)
                 found[domain] = href
 
-    logger.info("search_category_sites: found %d results for %s", len(found), title)
+    logger.info(
+        "search_category_sites: found %d results for %s", len(found), title
+    )
     return found
 
 
@@ -883,7 +882,9 @@ def format_ott_text(title: str, ott_results: Dict[str, List[Dict[str, Any]]]) ->
     return "\n".join(lines).strip()
 
 
-def build_ott_keyboard(ott_results: Dict[str, List[Dict[str, Any]]]) -> InlineKeyboardMarkup:
+def build_ott_keyboard(
+    ott_results: Dict[str, List[Dict[str, Any]]]
+) -> InlineKeyboardMarkup:
     keyboard = []
     for country_code, providers in ott_results.items():
         country = COUNTRY_INFO.get(country_code, {"flag": "🏳️", "name": country_code})
@@ -919,7 +920,10 @@ def format_season_label(season: Dict[str, Any]) -> str:
 
 def format_episode_guide_text(title: str, seasons: List[Dict[str, Any]]) -> str:
     lines = [f"📚 Episode Guide for {title}", ""]
-    valid = [s for s in seasons if isinstance(s, dict) and s.get("season_number") is not None]
+    valid = [
+        s for s in seasons
+        if isinstance(s, dict) and s.get("season_number") is not None
+    ]
     if not valid:
         lines.append("❌ No season data available.")
         return "\n".join(lines)
@@ -928,7 +932,9 @@ def format_episode_guide_text(title: str, seasons: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_episode_guide_keyboard(seasons: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+def build_episode_guide_keyboard(
+    seasons: List[Dict[str, Any]]
+) -> InlineKeyboardMarkup:
     keyboard: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
     for season in seasons:
@@ -976,12 +982,20 @@ def build_main_keyboard(
             InlineKeyboardButton("📺 OTT",      callback_data=ott_cb),
         ],
         [
-            InlineKeyboardButton(_category_label(CATEGORY_MOVIE), callback_data=f"cat:{CATEGORY_MOVIE}"),
-            InlineKeyboardButton(_category_label(CATEGORY_TV),    callback_data=f"cat:{CATEGORY_TV}"),
+            InlineKeyboardButton(
+                _category_label(CATEGORY_MOVIE), callback_data=f"cat:{CATEGORY_MOVIE}"
+            ),
+            InlineKeyboardButton(
+                _category_label(CATEGORY_TV), callback_data=f"cat:{CATEGORY_TV}"
+            ),
         ],
         [
-            InlineKeyboardButton(_category_label(CATEGORY_ANIME), callback_data=f"cat:{CATEGORY_ANIME}"),
-            InlineKeyboardButton(_category_label(CATEGORY_GAME),  callback_data=f"cat:{CATEGORY_GAME}"),
+            InlineKeyboardButton(
+                _category_label(CATEGORY_ANIME), callback_data=f"cat:{CATEGORY_ANIME}"
+            ),
+            InlineKeyboardButton(
+                _category_label(CATEGORY_GAME), callback_data=f"cat:{CATEGORY_GAME}"
+            ),
         ],
     ]
     if show_episode_guide:
@@ -992,7 +1006,9 @@ def build_main_keyboard(
     start = page * RESULTS_PER_PAGE
     end   = start + RESULTS_PER_PAGE
     for domain, url in all_results[start:end]:
-        keyboard.append([InlineKeyboardButton(BUTTON_NAMES.get(domain, domain), url=url)])
+        keyboard.append([
+            InlineKeyboardButton(BUTTON_NAMES.get(domain, domain), url=url)
+        ])
 
     nav: List[InlineKeyboardButton] = []
     if page > 0:
@@ -1058,7 +1074,9 @@ def get_category_page(context: ContextTypes.DEFAULT_TYPE, category: str) -> int:
     return context.user_data.setdefault("category_pages", {}).get(category, 0)
 
 
-def set_category_page(context: ContextTypes.DEFAULT_TYPE, category: str, page: int) -> None:
+def set_category_page(
+    context: ContextTypes.DEFAULT_TYPE, category: str, page: int
+) -> None:
     context.user_data.setdefault("category_pages", {})[category] = page
     context.user_data["page"] = page
 
@@ -1074,10 +1092,14 @@ def set_active_category(context: ContextTypes.DEFAULT_TYPE, category: str) -> No
     results = get_results_for_category(context, category)
     all_results = list(results.items())
     page = get_category_page(context, category)
-    max_page = max(0, (len(all_results) - 1) // RESULTS_PER_PAGE) if all_results else 0
+    max_page = (
+        max(0, (len(all_results) - 1) // RESULTS_PER_PAGE) if all_results else 0
+    )
     page = max(0, min(page, max_page))
     set_category_page(context, category, page)
-    raw_title = context.user_data.get("raw_title") or context.user_data.get("current_title", "")
+    raw_title = (
+        context.user_data.get("raw_title") or context.user_data.get("current_title", "")
+    )
     info = context.user_data.get("current_tmdb_info")
     context.user_data["results"] = all_results
     context.user_data["current_category"] = category
@@ -1174,7 +1196,9 @@ async def execute_search(
             if isinstance(s, dict) and s.get("season_number") is not None
         ] if info else []
 
-        detected_category = await resolve_detected_category(raw_title, info, forced_category)
+        detected_category = await resolve_detected_category(
+            raw_title, info, forced_category
+        )
 
         # Check cache before searching
         cache_key = make_cache_key(get_category_cache_prefix(detected_category), title)
@@ -1182,40 +1206,43 @@ async def execute_search(
         if cached is not None:
             results = resolve_cached_category_results(cached)
         else:
-            results = await asyncio.to_thread(search_category_sites, title, detected_category)
+            results = await asyncio.to_thread(
+                search_category_sites, title, detected_category
+            )
             if cache_key:
-                await asyncio.to_thread(save_cache, cache_key, results or CACHE_EMPTY_MARKER)
+                await asyncio.to_thread(
+                    save_cache, cache_key, results or CACHE_EMPTY_MARKER
+                )
 
-    if not results:
-       msg = f'❌ "{raw_title}" was not found on any configured sites.'
+        # ── No results found ──────────────────────────────────────────────────
+        if not results:
+            msg = f'❌ "{raw_title}" was not found on any configured sites.'
 
-       suggestions = []
+            suggestions = []
+            if info:
+                if info.get("title"):
+                    suggestions.append(info["title"])
+                for alias in info.get("aliases", []):
+                    if alias not in suggestions:
+                        suggestions.append(alias)
 
-       if info:
-          if info.get("title"):
-              suggestions.append(info["title"])
+            if suggestions:
+                msg += "\n\n💡 Did you mean:\n"
+                msg += "\n".join(f"• {s}" for s in suggestions[:5])
 
-          for alias in info.get("aliases", []):
-              if alias not in suggestions:
-                  suggestions.append(alias)
+            if status:
+                await safe_telegram_call(
+                    status.edit_text(msg),
+                    "edit status empty",
+                )
+            else:
+                await safe_telegram_call(
+                    update.message.reply_text(msg),
+                    "send empty",
+                )
+            return
 
-       if suggestions:
-           msg += "\n\n💡 Did you mean:\n"
-           msg += "\n".join(f"• {s}" for s in suggestions[:5])
-
-       if status:
-           await safe_telegram_call(
-               status.edit_text(msg),
-               "edit status empty"
-           )
-       else:
-           await safe_telegram_call(
-                update.message.reply_text(msg),
-                "send empty"
-          )
-
-       return
-
+        # ── Build and send results ────────────────────────────────────────────
         caption = build_results_caption(raw_title, info, detected_category)
         all_results = list(results.items())
         normalized_title = normalize_title(title)
@@ -1223,25 +1250,26 @@ async def execute_search(
 
         reset_search_state(context)
         context.user_data.update({
-            "results":              all_results,
-            "category_results":     {detected_category: results},
-            "category_pages":       {cat: 0 for cat in SEARCH_CATEGORIES},
-            "category_cache_keys":  {detected_category: cache_key} if cache_key else {},
-            "current_title":        title,
-            "raw_title":            raw_title,
-            "current_tmdb_info":    info,
-            "current_title_key":    normalized_title,
-            "current_category":     detected_category,
-            "current_title_token":  title_token,
-            "main_caption":         caption,
-            "current_is_tv":        is_tv,
-            "current_seasons":      seasons,
+            "results":             all_results,
+            "category_results":    {detected_category: results},
+            "category_pages":      {cat: 0 for cat in SEARCH_CATEGORIES},
+            "category_cache_keys": {detected_category: cache_key} if cache_key else {},
+            "current_title":       title,
+            "raw_title":           raw_title,
+            "current_tmdb_info":   info,
+            "current_title_key":   normalized_title,
+            "current_category":    detected_category,
+            "current_title_token": title_token,
+            "main_caption":        caption,
+            "current_is_tv":       is_tv,
+            "current_seasons":     seasons,
         })
         if title_token:
             store_token(context, "title_tokens", title_token, title)
 
         keyboard = build_main_keyboard(
-            all_results, title,
+            all_results,
+            title,
             page=0,
             show_episode_guide=is_tv and bool(seasons),
             active_category=detected_category,
@@ -1263,34 +1291,45 @@ async def execute_search(
                 await safe_telegram_call(status.delete(), "delete status")
             elif status:
                 await safe_telegram_call(
-                    status.edit_text(caption, parse_mode="HTML",
-                                     reply_markup=reply_markup,
-                                     disable_web_page_preview=True),
+                    status.edit_text(
+                        caption,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True,
+                    ),
                     "edit status fallback",
                 )
         else:
-            target = status or None
-            if target:
+            if status:
                 await safe_telegram_call(
-                    target.edit_text(caption, parse_mode="HTML",
-                                     reply_markup=reply_markup,
-                                     disable_web_page_preview=True),
+                    status.edit_text(
+                        caption,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True,
+                    ),
                     "edit status",
                 )
             else:
                 await safe_telegram_call(
-                    update.message.reply_text(caption, parse_mode="HTML",
-                                              reply_markup=reply_markup,
-                                              disable_web_page_preview=True),
+                    update.message.reply_text(
+                        caption,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True,
+                    ),
                     "send results",
                 )
+
     except Exception:
         logger.exception("execute_search failed for %s", raw_title)
         msg = "❌ Something went wrong. Please try again."
         if status:
             await safe_telegram_call(status.edit_text(msg), "edit status error")
         else:
-            await safe_telegram_call(update.message.reply_text(msg), "send error")
+            await safe_telegram_call(
+                update.message.reply_text(msg), "send error"
+            )
 
 
 async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1319,17 +1358,22 @@ async def _category_command(
 async def movie_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _category_command(update, context, CATEGORY_MOVIE, "/movie <title>")
 
+
 async def tv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _category_command(update, context, CATEGORY_TV, "/tv <title>")
 
+
 async def anime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _category_command(update, context, CATEGORY_ANIME, "/anime <title>")
+
 
 async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _category_command(update, context, CATEGORY_GAME, "/game <title>")
 
 
-async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def favorites_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     if not update.message:
         return
     rows = await asyncio.to_thread(get_favorites, update.message.from_user.id)
@@ -1368,7 +1412,9 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Callback handler
 # ════════════════════════════════════════════════════════════════════════════
 
-async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def favorite_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     query = update.callback_query
     if not query:
         return
@@ -1380,12 +1426,18 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         # ── Add to favorites ─────────────────────────────────────────────────
         if data.startswith("fav:") or data == "fav":
-            token = data[4:] if data.startswith("fav:") else context.user_data.get("current_title_token", "")
-            title = (get_token_value(context, "title_tokens", token) if token else None) \
-                    or context.user_data.get("current_title", "")
+            token = (
+                data[4:] if data.startswith("fav:")
+                else context.user_data.get("current_title_token", "")
+            )
+            title = (
+                get_token_value(context, "title_tokens", token) if token else None
+            ) or context.user_data.get("current_title", "")
             if not title:
                 await safe_telegram_call(
-                    query.answer("Search expired — please search again.", show_alert=True),
+                    query.answer(
+                        "Search expired — please search again.", show_alert=True
+                    ),
                     "fav expired",
                 )
                 return
@@ -1402,7 +1454,9 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             results = get_results_for_category(context, cat)
             all_results = list(results.items())
             if not all_results:
-                await safe_telegram_call(query.answer("No results to paginate."), "page empty")
+                await safe_telegram_call(
+                    query.answer("No results to paginate."), "page empty"
+                )
                 return
             page = get_category_page(context, cat)
             page += 1 if data == "next" else -1
@@ -1416,8 +1470,10 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 and context.user_data.get("current_seasons")
             )
             kb = build_main_keyboard(
-                all_results, context.user_data.get("current_title", ""),
-                page=page, show_episode_guide=bool(show_guide),
+                all_results,
+                context.user_data.get("current_title", ""),
+                page=page,
+                show_episode_guide=bool(show_guide),
                 active_category=cat,
                 title_token=context.user_data.get("current_title_token"),
             )
@@ -1431,19 +1487,20 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await safe_telegram_call(query.answer(), "cat switch")
             category = data[4:].strip()
             if category not in SEARCH_CATEGORIES:
-                await safe_telegram_call(query.answer("Invalid category."), "cat invalid")
+                await safe_telegram_call(
+                    query.answer("Invalid category."), "cat invalid"
+                )
                 return
 
             cat_store = context.user_data.setdefault("category_results", {})
 
-            # BUG FIX: use sentinel None to distinguish "not yet searched" from
-            # "searched and found nothing" (empty dict).  An empty dict means we
-            # already know there are no results — do not search again.
             if category not in cat_store:
                 title = context.user_data.get("current_title", "")
                 if not title:
                     await safe_telegram_call(
-                        query.answer("Search expired — please search again.", show_alert=True),
+                        query.answer(
+                            "Search expired — please search again.", show_alert=True
+                        ),
                         "cat expired",
                     )
                     return
@@ -1455,24 +1512,28 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if cache_key:
                     cat_cache_keys[category] = cache_key
 
-                cached = await asyncio.to_thread(get_cached, cache_key) if cache_key else None
+                cached = (
+                    await asyncio.to_thread(get_cached, cache_key)
+                    if cache_key else None
+                )
                 if cached is not None:
                     new_results = resolve_cached_category_results(cached)
                 else:
-                    new_results = await asyncio.to_thread(search_category_sites, title, category)
+                    new_results = await asyncio.to_thread(
+                        search_category_sites, title, category
+                    )
                     if cache_key:
                         await asyncio.to_thread(
                             save_cache, cache_key, new_results or CACHE_EMPTY_MARKER
                         )
 
-                # Store result (even empty) so we don't re-search on next click
                 cat_store[category] = new_results
 
                 if not new_results:
-                    # BUG FIX: return after toast so we don't fall through to
-                    # set_active_category with empty data
                     await safe_telegram_call(
-                        query.answer("No results found in this category", show_alert=False),
+                        query.answer(
+                            "No results found in this category", show_alert=False
+                        ),
                         "cat no results",
                     )
                     return
@@ -1487,8 +1548,10 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 and context.user_data.get("current_seasons")
             )
             kb = build_main_keyboard(
-                all_results, current_title,
-                page=page, show_episode_guide=bool(show_guide),
+                all_results,
+                current_title,
+                page=page,
+                show_episode_guide=bool(show_guide),
                 active_category=category,
                 title_token=context.user_data.get("current_title_token"),
             )
@@ -1497,7 +1560,8 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 caption += f"\n\n❌ No results for {category_display_label(category)}."
             await safe_telegram_call(
                 query.edit_message_text(
-                    caption, parse_mode="HTML",
+                    caption,
+                    parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(kb),
                     disable_web_page_preview=True,
                 ),
@@ -1507,12 +1571,15 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # ── Remove favorite ───────────────────────────────────────────────────
         elif data.startswith("remove:"):
             token = data[7:]
-            # BUG FIX: only use token as title if it's a valid lookup; never
-            # use a raw hash digest as a DB value.
-            title = get_token_value(context, "favorite_tokens", token) if token else None
+            title = (
+                get_token_value(context, "favorite_tokens", token) if token else None
+            )
             if not title:
                 await safe_telegram_call(
-                    query.answer("Favorite expired — open /favorites to refresh.", show_alert=True),
+                    query.answer(
+                        "Favorite expired — open /favorites to refresh.",
+                        show_alert=True,
+                    ),
                     "remove expired",
                 )
                 return
@@ -1522,7 +1589,7 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "remove fav",
             )
 
-        # ── Back to main ─────────────────────────────────────────────────────
+        # ── Back to main ──────────────────────────────────────────────────────
         elif data == "back:main":
             await safe_telegram_call(query.answer(), "back:main")
             cat = context.user_data.get("current_category", CATEGORY_MOVIE)
@@ -1541,7 +1608,8 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if not all_results:
                 caption += f"\n\n❌ No results for {category_display_label(cat)}."
             kb = build_main_keyboard(
-                all_results, context.user_data.get("current_title", ""),
+                all_results,
+                context.user_data.get("current_title", ""),
                 page=get_category_page(context, cat),
                 show_episode_guide=bool(show_guide),
                 active_category=cat,
@@ -1549,7 +1617,8 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             await safe_telegram_call(
                 query.edit_message_text(
-                    caption, parse_mode="HTML",
+                    caption,
+                    parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(kb),
                     disable_web_page_preview=True,
                 ),
@@ -1560,7 +1629,9 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         elif data == "guide:episodes":
             seasons = context.user_data.get("current_seasons", [])
             if not seasons:
-                await safe_telegram_call(query.answer("No season guide available."), "guide empty")
+                await safe_telegram_call(
+                    query.answer("No season guide available."), "guide empty"
+                )
                 return
             await safe_telegram_call(query.answer(), "guide episodes")
             await safe_telegram_call(
@@ -1583,12 +1654,18 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # ── OTT lookup ────────────────────────────────────────────────────────
         elif data.startswith("ott:") or data == "ott":
             await safe_telegram_call(query.answer(), "ott")
-            token = data[4:] if data.startswith("ott:") else context.user_data.get("current_title_token", "")
-            title = (get_token_value(context, "title_tokens", token) if token else None) \
-                    or context.user_data.get("current_title", "")
+            token = (
+                data[4:] if data.startswith("ott:")
+                else context.user_data.get("current_title_token", "")
+            )
+            title = (
+                get_token_value(context, "title_tokens", token) if token else None
+            ) or context.user_data.get("current_title", "")
             if not title:
                 await safe_telegram_call(
-                    query.answer("Search expired — please search again.", show_alert=True),
+                    query.answer(
+                        "Search expired — please search again.", show_alert=True
+                    ),
                     "ott expired",
                 )
                 return
@@ -1599,7 +1676,10 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
             if ott_data is None:
                 cache_key = make_cache_key(CACHE_PREFIX_OTT, title)
-                cached = await asyncio.to_thread(get_cached, cache_key) if cache_key else None
+                cached = (
+                    await asyncio.to_thread(get_cached, cache_key)
+                    if cache_key else None
+                )
                 if cached is not None:
                     ott_data = cached
                 else:
@@ -1653,11 +1733,11 @@ async def cleanup_cache_job(_: ContextTypes.DEFAULT_TYPE) -> None:
 def _fallback_cleanup_loop() -> None:
     """
     Background daemon thread used when python-telegram-bot[job-queue] is not
-    installed.  Runs cleanup_cache() every CACHE_CLEANUP_INTERVAL seconds.
-    The thread is daemonised so it never prevents process exit.
+    installed.
     """
     logger.info(
-        "Fallback cache-cleanup thread started (interval=%ds)", CACHE_CLEANUP_INTERVAL
+        "Fallback cache-cleanup thread started (interval=%ds)",
+        CACHE_CLEANUP_INTERVAL,
     )
     while True:
         time.sleep(CACHE_CLEANUP_INTERVAL)
@@ -1726,14 +1806,15 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_title))
     app.add_handler(CallbackQueryHandler(favorite_callback))
 
-    # ── JobQueue is optional (needs python-telegram-bot[job-queue]) ──────────
     if app.job_queue is not None:
         app.job_queue.run_repeating(
             cleanup_cache_job,
             interval=CACHE_CLEANUP_INTERVAL,
             first=CACHE_CLEANUP_INTERVAL,
         )
-        logger.info("JobQueue cache-cleanup scheduled every %ds", CACHE_CLEANUP_INTERVAL)
+        logger.info(
+            "JobQueue cache-cleanup scheduled every %ds", CACHE_CLEANUP_INTERVAL
+        )
     else:
         logger.warning(
             "JobQueue not available (install python-telegram-bot[job-queue] for "
