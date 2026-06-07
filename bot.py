@@ -865,28 +865,7 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
     logger.info(
         "search_category_sites: found %d results for %s", len(found), title
     )
-    return found
-    
-
-    try:
-        all_results = await asyncio.to_thread(
-            search_category_sites,
-            title,
-            category
-        )
-
-        for domain, url in all_results.items():
-
-            if domain not in existing_results:
-                existing_results[domain] = url
-
-            if len(existing_results) >= MAX_TOTAL_RESULTS:
-                break
-
-        context.user_data["category_results"][category] = existing_results
-
-    except Exception as e:
-        logger.exception("Background search failed: %s", e)    
+    return found   
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1041,6 +1020,7 @@ def build_main_keyboard(
     nav: List[InlineKeyboardButton] = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅ Previous", callback_data="prev"))
+    logger.info("PAGINATION DEBUG: page=%s end=%s total=%s",page,end,len(all_results))
     if end < len(all_results):
         nav.append(InlineKeyboardButton("Next ➡", callback_data="next"))
     if nav:
