@@ -1187,6 +1187,7 @@ async def execute_search(
             f"❌ Please keep titles under {MAX_TITLE_LENGTH} characters."
         )
         return
+    search_start = time.time()
 
     await asyncio.to_thread(save_history, update.message.from_user.id, raw_title)
     status = await safe_telegram_call(
@@ -1255,6 +1256,8 @@ async def execute_search(
 
         # ── Build and send results ────────────────────────────────────────────
         caption = build_results_caption(raw_title, info, detected_category)
+        elapsed = round(time.time() - search_start, 2)
+        caption += f"\n⏱ Search Time: {elapsed}s"
         all_results = list(results.items())
         normalized_title = normalize_title(title)
         title_token = build_title_token(title) or ""
