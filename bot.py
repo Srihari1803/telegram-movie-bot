@@ -55,7 +55,7 @@ SITES_FILE = os.path.join(_BASE_DIR, "sites.json")
 DB_TIMEOUT = 30
 DB_BUSY_TIMEOUT_MS = 5000
 
-CACHE_DURATION = 86400          # 24 hours
+CACHE_DURATION = 604800          # 24 hours
 CACHE_CLEANUP_INTERVAL = 3600   # 1 hour
 
 # Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
@@ -835,7 +835,7 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
         return {}
 
     found: Dict[str, str] = {}
-    max_workers = min(8, len(sites))
+    max_workers = min(20, len(sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
             executor.submit(search_category_site, title, site): site
@@ -1187,7 +1187,21 @@ async def execute_search(
                 await asyncio.to_thread(save_cache, cache_key, results or CACHE_EMPTY_MARKER)
 
         if not results:
-            msg = f'❌ "{raw_title}" was not found on any configured sites.'
+    msg = f'❌ "{raw_title}" was not found on any configured sites.'
+
+    if info:
+        suggestions = []
+
+        if info.get("title"):
+            suggestions.append(info["title"])
+
+        for alias in info.get("aliases", []):
+            if alias not in suggestions:
+                suggestions.append(alias)
+
+        if suggestions:
+            msg += "\n\n💡 Did you mean:\n"
+            msg += "\n".join(f"• {s}" for s in suggestions[:5])
             if status:
                 await safe_telegram_call(status.edit_text(msg), "edit status empty")
             else:
