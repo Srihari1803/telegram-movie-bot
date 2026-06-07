@@ -793,7 +793,8 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
         return None
     queries = [
         f'"{title}" site:{site_domain}',
-        f"{title} site:{site_domain}",
+        f'"{title}" site:{site_domain}',
+        f'"{title}" streaming site:{site_domain}',
     ]
     try:
         with DDGS() as ddgs:
@@ -809,6 +810,10 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
                     href = item.get("href") or item.get("url")
                     logger.info("FOUND URL: %s", href)
                     if not href or not is_valid_http_url(href):
+                        continue
+                    # Skip homepages — must have a non-empty path beyond "/"
+                    path = urlparse(href).path.strip("/")
+                    if not path:
                         continue
                     if site_domain in normalize_site_domain(href):
                         logger.info("Hit: %s → %s", site_domain, href)
