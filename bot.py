@@ -1187,7 +1187,7 @@ async def execute_search(
                 await asyncio.to_thread(save_cache, cache_key, results or CACHE_EMPTY_MARKER)
 
         if not results:
-    msg = f'❌ "{raw_title}" was not found on any configured sites.'
+            msg = f'❌ "{raw_title}" was not found on any configured sites.'
 
     if info:
         suggestions = []
