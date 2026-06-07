@@ -61,7 +61,8 @@ CACHE_CLEANUP_INTERVAL = 3600    # 1 hour
 # Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
 _cleanup_thread: Optional[threading.Thread] = None
 RESULTS_PER_PAGE = 5
-MAX_SEARCH_RESULTS = 8
+MAX_SEARCH_RESULTS = 10
+INITIAL_RESULTS = 5
 MAX_OVERVIEW_LENGTH = 400
 MAX_TITLE_LENGTH = 120
 TOKEN_CACHE_LIMIT = 25
@@ -864,6 +865,32 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
         "search_category_sites: found %d results for %s", len(found), title
     )
     return found
+    
+async def background_search_sites(
+    context,
+    title,
+    category,
+    existing_results
+):
+    try:
+        all_results = await asyncio.to_thread(
+            search_category_sites,
+            title,
+            category
+        )
+
+        for domain, url in all_results.items():
+
+            if domain not in existing_results:
+                existing_results[domain] = url
+
+            if len(existing_results) >= MAX_TOTAL_RESULTS:
+                break
+
+        context.user_data["category_results"][category] = existing_results
+
+    except Exception as e:
+        logger.exception("Background search failed: %s", e)    
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1211,9 +1238,21 @@ async def execute_search(
         if cached is not None:
             results = resolve_cached_category_results(cached)
         else:
-            results = await asyncio.to_thread(
+            all_results = await asyncio.to_thread(
                 search_category_sites, title, detected_category
             )
+            results = dict(
+                list(all_results.items())[:INITIAL_RESULTS]
+            )
+            asyncio.create_task(
+                background_search_sites(
+                    context,
+                    title,
+                    detected_category,
+                    results
+                )
+            )
+            
             if cache_key:
                 await asyncio.to_thread(
                     save_cache, cache_key, results or CACHE_EMPTY_MARKER
@@ -1456,8 +1495,14 @@ async def favorite_callback(
         elif data in ("next", "prev"):
             await safe_telegram_call(query.answer(), "pagination")
             cat = context.user_data.get("current_category", CATEGORY_MOVIE)
-            results = get_results_for_category(context, cat)
-            all_results = list(results.items())
+            latest_results = get_results_for_category(
+                context,
+                cat
+            )
+
+            all_results = list(
+                latest_results.items()
+            )
             if not all_results:
                 await safe_telegram_call(
                     query.answer("No results to paginate."), "page empty"
