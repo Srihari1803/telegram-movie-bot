@@ -1071,8 +1071,10 @@ def build_results_caption(
             caption += f"\n{overview}\n"
     else:
         caption = f'🎬 <b>Results for "{raw_title}"</b>\n🧭 Category: {label}\n'
+        
     caption += f"\n⏱ Search Time: {search_time}s"
     caption += "\n🔗 Select a source below:"
+    
     return caption
 
 
