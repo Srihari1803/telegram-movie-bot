@@ -1243,6 +1243,7 @@ async def execute_search(
                 search_category_sites, title, detected_category
             )
             results = all_results
+            logger.info("TOTAL RESULTS FOUND = %s", len(results))
             
             if cache_key:
                 await asyncio.to_thread(
