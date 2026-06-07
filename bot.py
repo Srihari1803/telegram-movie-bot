@@ -795,8 +795,8 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
         return None
     queries = [
         f'"{title}" site:{site_domain}',
-        f'"{title}" site:{site_domain}',
-        f'"{title}" streaming site:{site_domain}',
+        f'{title} watch online site:{site_domain}',
+        f'{title} streaming site:{site_domain}',
     ]
     try:
         with DDGS() as ddgs:
@@ -1242,21 +1242,11 @@ async def execute_search(
             all_results = await asyncio.to_thread(
                 search_category_sites, title, detected_category
             )
-            results = dict(
-                list(all_results.items())[:INITIAL_RESULTS]
-            )
-            asyncio.create_task(
-                background_search_sites(
-                    context,
-                    title,
-                    detected_category,
-                    results
-                )
-            )
+            results = all_results
             
             if cache_key:
                 await asyncio.to_thread(
-                    save_cache, cache_key, results or CACHE_EMPTY_MARKER
+                    save_cache, cache_key, all_results or CACHE_EMPTY_MARKER
                 )
 
         # ── No results found ──────────────────────────────────────────────────
