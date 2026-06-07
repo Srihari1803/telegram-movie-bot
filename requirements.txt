@@ -1,8 +1,8 @@
 python-telegram-bot[job-queue]==22.1
-requests==2.31.0
+requests>=2.32.4
 beautifulsoup4==4.12.3
-lxml==5.1.0
-python-dotenv==1.0.1
-yt-dlp==2024.3.10
+lxml>=5.4.0
+python-dotenv>=1.1.1
+yt-dlp>=2026.05.01
 ddgs
 supabase
