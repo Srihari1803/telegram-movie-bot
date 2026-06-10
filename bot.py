@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import hashlib
 import json
 import logging
@@ -1752,12 +1753,99 @@ async def favorite_callback(
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Memory management
+# ════════════════════════════════════════════════════════════════════════════
+
+def clear_memory_caches() -> int:
+    """
+    Aggressively clear all caches and force garbage collection.
+    Returns number of cache entries cleared.
+    """
+    try:
+        # Clear Supabase cache table (aggressive cleanup — everything older than 1 second)
+        cutoff = int(time.time()) - 1
+        response = (
+            supabase.table("cache")
+            .delete()
+            .lt("created_at", cutoff)
+            .execute()
+        )
+        cleared = len(response.data) if response.data else 0
+
+        # Force garbage collection
+        gc.collect()
+
+        logger.info(
+            "Memory cleanup: cleared %d cache entries, ran gc.collect()", cleared
+        )
+        return cleared
+    except Exception:
+        logger.exception("Memory cache clearing failed")
+        return 0
+
+
+async def check_and_clear_memory_if_oom() -> bool:
+    """
+    Check current memory usage and clear caches if approaching OOM.
+    Returns True if memory was cleared, False if memory is OK.
+    """
+    try:
+        import psutil
+
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_percent = process.memory_percent()
+
+        # Log current memory usage
+        logger.info(
+            "Memory usage: %.1f%% (%d MB / %d MB)",
+            memory_percent,
+            memory_info.rss // (1024 * 1024),
+            psutil.virtual_memory().total // (1024 * 1024),
+        )
+
+        # Clear caches if memory usage exceeds 85%
+        if memory_percent > 85:
+            logger.warning(
+                "Memory usage critical (%.1f%%). Clearing caches...", memory_percent
+            )
+            cleared = await asyncio.to_thread(clear_memory_caches)
+            logger.info(
+                "Cleared %d cache entries. New memory: %.1f%%",
+                cleared,
+                process.memory_percent(),
+            )
+            return True
+
+        return False
+    except ImportError:
+        # Fallback: use resource module if psutil not available
+        try:
+            import resource
+
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            rss_mb = usage.ru_maxrss // 1024  # Convert to MB
+            logger.debug("Memory usage (resource): %d MB", rss_mb)
+            return False
+        except Exception:
+            logger.debug("Memory monitoring unavailable")
+            return False
+    except Exception:
+        logger.exception("Memory check failed")
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Background jobs
 # ════════════════════════════════════════════════════════════════════════════
 
 async def cleanup_cache_job(_: ContextTypes.DEFAULT_TYPE) -> None:
     """Periodic cache cleanup driven by JobQueue (preferred path)."""
     try:
+        # Check memory and clear if approaching OOM before regular cleanup
+        await check_and_clear_memory_if_oom()
+
+        # Regular cache cleanup
         removed = await asyncio.to_thread(cleanup_cache)
         if removed:
             logger.info("Cache cleanup: removed %d expired entries", removed)
