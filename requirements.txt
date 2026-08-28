@@ -6,3 +6,4 @@ python-dotenv>=1.1.1
 yt-dlp>=2025.6.9
 ddgs
 supabase
+mistralai>=2
