@@ -23,6 +23,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -1874,6 +1875,7 @@ def main() -> None:
     logger.info("✅ Bot starting up...")
     logger.info("BOT_TOKEN present:    %s", bool(BOT_TOKEN))
     logger.info("TMDB_API_KEY present: %s", bool(TMDB_API_KEY))
+    logger.info("MISTRAL_API_KEY present: %s", bool(MISTRAL_API_KEY))
     logger.info("Working directory:    %s", os.getcwd())
     logger.info("Bot script location:  %s", _BASE_DIR)
     logger.info("DB file:              %s", DB_FILE)
@@ -1920,6 +1922,23 @@ def main() -> None:
             "scheduled cleanup). Falling back to daemon thread."
         )
         start_fallback_cleanup_thread()
+
+    # Set Telegram command menu
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "Show help"),
+            BotCommand("ai", "Ask the AI"),
+            BotCommand("movie", "Search for a movie"),
+            BotCommand("tv", "Search for a TV show"),
+            BotCommand("anime", "Search for anime"),
+            BotCommand("game", "Search for a game"),
+            BotCommand("sites", "Show configured sites"),
+            BotCommand("favorites", "Show favorites"),
+            BotCommand("history", "Show search history"),
+        ])
+
+    app.post_init = post_init
 
     logger.info("Bot is polling...")
     app.run_polling(drop_pending_updates=True)
