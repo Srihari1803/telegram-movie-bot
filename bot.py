@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+from mistralai.client import Mistral
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -40,6 +41,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+mistral_client = Mistral(api_key=MISTRAL_API_KEY) if MISTRAL_API_KEY else None
 
 supabase = create_client(
     SUPABASE_URL,
@@ -1129,6 +1132,66 @@ def set_active_category(context: ContextTypes.DEFAULT_TYPE, category: str) -> No
 # Command handlers
 # ════════════════════════════════════════════════════════════════════════════
 
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    if not mistral_client:
+        await update.message.reply_text(
+            "❌ AI is not configured yet."
+        )
+        return
+
+    prompt = " ".join(context.args).strip()
+
+    if not prompt:
+        await update.message.reply_text(
+            "🤖 Ask me anything about movies or TV shows!\n\n"
+            "Examples:\n"
+            "• /ai Movies like Interstellar\n"
+            "• /ai Best sci-fi movies from 2024\n"
+            "• /ai What should I watch tonight?\n"
+            "• /ai Movies similar to Inception"
+        )
+        return
+
+    try:
+        await update.message.chat.send_action("typing")
+
+        response = await asyncio.to_thread(
+            mistral_client.chat.complete,
+            model="mistral-small-latest",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful movie and TV assistant inside a "
+                        "Telegram movie search bot. Give concise, useful, "
+                        "spoiler-free answers. When recommending movies or "
+                        "shows, include the title and year when possible. "
+                        "Do not invent streaming availability or direct links."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+        )
+
+        answer = response.choices[0].message.content
+
+        if not answer:
+            answer = "Sorry, I couldn't generate a response."
+
+        await update.message.reply_text(answer)
+
+    except Exception:
+        logger.exception("Mistral AI request failed")
+        await update.message.reply_text(
+            "❌ Sorry, the AI service is temporarily unavailable."
+        )
+        
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -1831,6 +1894,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("help",      help_command))
+    app.add_handler(CommandHandler("ai",        ai_command))
     app.add_handler(CommandHandler("sites",     sites_command))
     app.add_handler(CommandHandler("movie",     movie_command))
     app.add_handler(CommandHandler("tv",        tv_command))
