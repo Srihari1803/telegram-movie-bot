@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from mistralai.client import Mistral
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1875,6 +1876,31 @@ def start_fallback_cleanup_thread() -> None:
         daemon=True,
     )
     _cleanup_thread.start()
+    class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server() -> None:
+    port = int(os.getenv("PORT", "8080"))
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+
+    logger.info("Health server listening on port %d", port)
+
+    server.serve_forever()
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1953,6 +1979,13 @@ def main() -> None:
         ])
 
     app.post_init = post_init
+    
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True,
+        name="health-server",
+    )
+    health_thread.start()
 
     logger.info("Bot is polling...")
     app.run_polling(drop_pending_updates=True)
