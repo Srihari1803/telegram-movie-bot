@@ -84,8 +84,6 @@ TOKEN_CACHE_LIMIT = 25
 HTTP_TIMEOUT: Tuple[int, int] = (5, 15)   # (connect, read)
 HTTP_POOL_SIZE = 20
 DDG_TIMEOUT_SECONDS = 8
-DDG_MAX_ATTEMPTS = 2
-DDG_RETRY_BACKOFF_SECONDS = 1
 DDG_PROVIDER_COOLDOWN_SECONDS = 300
 DDG_PROVIDER_FAILURE_THRESHOLD = 2
 DDG_BACKENDS = tuple(
@@ -633,6 +631,18 @@ def _provider_is_on_cooldown(provider: str) -> bool:
     return False
 
 
+def _available_search_backends() -> Tuple[str, ...]:
+    available = tuple(
+        backend for backend in DDG_BACKENDS
+        if not _provider_is_on_cooldown(backend)
+    )
+    logger.info(
+        "Search providers available for this search: %s",
+        ", ".join(available) if available else "none",
+    )
+    return available
+
+
 def _record_provider_failure(provider: str, status: str) -> None:
     with _ddg_provider_lock:
         failures = _ddg_provider_failures.get(provider, 0) + 1
@@ -653,7 +663,7 @@ def _record_provider_failure(provider: str, status: str) -> None:
             )
         else:
             logger.warning(
-                "Search provider: %s | Status: %s | Action: retry later",
+                "Search provider: %s | Status: %s | Action: unavailable for this search",
                 provider,
                 status,
             )
@@ -689,60 +699,47 @@ def fetch_ddgs_results(
     query: str,
     max_results: int,
     backend: Optional[str] = None,
+    on_failure: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch one provider safely; return [] after bounded failure handling."""
     provider = backend or "ddgs"
-    if _provider_is_on_cooldown(provider):
-        logger.info(
-            "Search provider: %s | Status: cooldown | Action: skipped",
+    try:
+        kwargs: Dict[str, Any] = {"max_results": max_results}
+        if backend:
+            kwargs["backend"] = backend
+        raw = ddgs.text(query, **kwargs)
+        results = list(raw or [])
+        if results:
+            _record_provider_success(provider, len(results))
+        else:
+            logger.info(
+                "Search provider: %s | Status: empty | Action: next provider",
+                provider,
+            )
+        return results
+    except (TimeoutException, DDGSException, requests.RequestException,
+            ConnectionError, OSError) as exc:
+        status = _classify_provider_error(exc)
+        if status == "timeout":
+            logger.warning("DDG search timed out for query: %s", query)
+        logger.warning(
+            "Search provider: %s | Status: %s | Action: skipped",
             provider,
+            status,
         )
-        return []
-
-    for attempt in range(1, DDG_MAX_ATTEMPTS + 1):
-        try:
-            kwargs: Dict[str, Any] = {"max_results": max_results}
-            if backend:
-                kwargs["backend"] = backend
-            raw = ddgs.text(query, **kwargs)
-            results = list(raw or [])
-            if results:
-                _record_provider_success(provider, len(results))
-            else:
-                logger.info(
-                    "Search provider: %s | Status: empty | Action: next provider",
-                    provider,
-                )
-            return results
-        except (TimeoutException, DDGSException, requests.RequestException,
-                ConnectionError, OSError) as exc:
-            status = _classify_provider_error(exc)
-            if status == "timeout":
-                logger.warning("DDG search timed out for query: %s", query)
-            logger.warning(
-                "Search provider: %s | Status: %s | Query: %s | Attempt: %d/%d",
-                provider,
-                status,
-                query,
-                attempt,
-                DDG_MAX_ATTEMPTS,
-            )
-            if status in {"403", "429", "captcha", "blocked"}:
-                _record_provider_failure(provider, status)
-                return []
-        except Exception as exc:
-            status = _classify_provider_error(exc)
-            logger.exception(
-                "Search provider: %s | Status: %s | Query: %s",
-                provider,
-                status,
-                query,
-            )
-            _record_provider_failure(provider, status)
-            return []
-        if attempt < DDG_MAX_ATTEMPTS:
-            time.sleep(DDG_RETRY_BACKOFF_SECONDS)
-    _record_provider_failure(provider, status)
+        _record_provider_failure(provider, status)
+        if on_failure:
+            on_failure(provider)
+    except Exception as exc:
+        status = _classify_provider_error(exc)
+        logger.exception(
+            "Search provider: %s | Status: %s | Action: skipped",
+            provider,
+            status,
+        )
+        _record_provider_failure(provider, status)
+        if on_failure:
+            on_failure(provider)
     return []
 
 
@@ -750,16 +747,35 @@ def fetch_search_provider_results(
     query: str,
     max_results: int,
     result_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    available_backends: Optional[Tuple[str, ...]] = None,
+    blocked_backends: Optional[Set[str]] = None,
+    blocked_lock: Optional[threading.Lock] = None,
 ) -> List[Dict[str, Any]]:
-    """Query configured providers sequentially, skipping cooled-down ones."""
+    """Query one shared provider set sequentially for this search."""
+    backends = (
+        available_backends
+        if available_backends is not None
+        else _available_search_backends()
+    )
+    blocked = blocked_backends if blocked_backends is not None else set()
+    lock = blocked_lock or threading.Lock()
+
+    def mark_failed(provider: str) -> None:
+        with lock:
+            blocked.add(provider)
+
     try:
         with DDGS(timeout=DDG_TIMEOUT_SECONDS) as ddgs:
-            for backend in DDG_BACKENDS:
+            for backend in backends:
+                with lock:
+                    if backend in blocked:
+                        continue
                 results = fetch_ddgs_results(
                     ddgs,
                     query,
                     max_results,
                     backend=backend,
+                    on_failure=mark_failed,
                 )
                 if results and (
                     result_filter is None
@@ -1031,7 +1047,37 @@ def search_ott(
 # Site search (parallelised per-category)
 # ════════════════════════════════════════════════════════════════════════════
 
-def search_category_site(title: str, site: str, year: Optional[int] = None,) -> Optional[Tuple[str, str]]:
+def _site_cache_key(title: str, site_domain: str, year: Optional[int]) -> Optional[str]:
+    return make_cache_key(
+        CACHE_PREFIX_SITE,
+        f"{title}|{year or ''}|{site_domain}",
+    )
+
+
+def _cached_site_result(
+    title: str,
+    site_domain: str,
+    year: Optional[int],
+) -> Tuple[bool, Optional[Tuple[str, str]]]:
+    cache_key = _site_cache_key(title, site_domain, year)
+    if not cache_key:
+        return False, None
+    cached = get_cached(cache_key)
+    if isinstance(cached, dict) and cached.get("url"):
+        return True, (site_domain, str(cached["url"]))
+    if is_empty_cache(cached):
+        return True, None
+    return False, None
+
+
+def search_category_site(
+    title: str,
+    site: str,
+    year: Optional[int] = None,
+    available_backends: Optional[Tuple[str, ...]] = None,
+    blocked_backends: Optional[Set[str]] = None,
+    blocked_lock: Optional[threading.Lock] = None,
+) -> Optional[Tuple[str, str]]:
     """
     Search a single site for *title*.
     Returns (domain, url) on success, None otherwise.
@@ -1039,16 +1085,10 @@ def search_category_site(title: str, site: str, year: Optional[int] = None,) -> 
     site_domain = normalize_site_domain(site)
     if not site_domain:
         return None
-    cache_key = make_cache_key(
-        CACHE_PREFIX_SITE,
-        f"{title}|{year or ''}|{site_domain}",
-    )
-    if cache_key:
-        cached = get_cached(cache_key)
-        if isinstance(cached, dict) and cached.get("url"):
-            return site_domain, str(cached["url"])
-        if is_empty_cache(cached):
-            return None
+    cache_key = _site_cache_key(title, site_domain, year)
+    cache_hit, cached_result = _cached_site_result(title, site_domain, year)
+    if cache_hit:
+        return cached_result
 
     queries = (
         [f'"{title}" {year} site:{site_domain}']
@@ -1076,6 +1116,9 @@ def search_category_site(title: str, site: str, year: Optional[int] = None,) -> 
                 query,
                 MAX_SEARCH_RESULTS,
                 result_filter=is_site_result,
+                available_backends=available_backends,
+                blocked_backends=blocked_backends,
+                blocked_lock=blocked_lock,
             )
             for item in results:
                 href = item.get("href") or item.get("url")
@@ -1116,11 +1159,67 @@ def search_category_sites(
         return {}
 
     found: Dict[str, str] = {}
-    max_workers = min(2, len(sites))
+    uncached_sites: List[str] = []
+    for site in sites:
+        site_domain = normalize_site_domain(site)
+        if not site_domain:
+            continue
+        try:
+            cache_hit, cached_result = _cached_site_result(title, site_domain, year)
+        except Exception:
+            logger.exception(
+                "Site cache lookup failed for title=%s site=%s",
+                title,
+                site_domain,
+            )
+            cache_hit, cached_result = False, None
+        if cache_hit:
+            if cached_result:
+                domain, href = cached_result
+                found[domain] = href
+                if progress_callback:
+                    try:
+                        progress_callback(domain, href)
+                    except Exception:
+                        logger.exception(
+                            "Search progress callback failed for cached %s",
+                            domain,
+                        )
+        else:
+            uncached_sites.append(site)
+
+    if not uncached_sites:
+        logger.info(
+            "Search complete from cache: %d results for %s",
+            len(found),
+            title,
+        )
+        return found
+
+    available_backends = _available_search_backends()
+    if not available_backends:
+        logger.info(
+            "Search providers unavailable; returning %d cached results for %s",
+            len(found),
+            title,
+        )
+        return found
+
+    blocked_backends: Set[str] = set()
+    blocked_lock = threading.Lock()
+    max_workers = min(2, len(uncached_sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
-            executor.submit(search_category_site, title, site, year): site
-            for site in sites
+            executor.submit(
+                search_category_site,
+                title,
+                site,
+                year,
+                available_backends,
+                blocked_backends,
+                blocked_lock,
+            ): site
+            for site in uncached_sites
         }
         for future in as_completed(future_to_site):
             site = future_to_site[future]
