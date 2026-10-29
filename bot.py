@@ -20,6 +20,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 from ddgs import DDGS
+from ddgs.exceptions import TimeoutException
 from supabase import create_client
 from telegram import (
     Update,
@@ -82,6 +83,8 @@ TOKEN_CACHE_LIMIT = 25
 
 HTTP_TIMEOUT: Tuple[int, int] = (5, 15)   # (connect, read)
 HTTP_POOL_SIZE = 20
+DDG_TIMEOUT_SECONDS = 8
+DDG_MAX_WORKERS = 4
 
 CACHE_PREFIX_MOVIE = "movie"
 CACHE_PREFIX_OTT = "ott"
@@ -610,9 +613,13 @@ def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[st
     try:
         raw = ddgs.text(query, max_results=max_results)
         return list(raw or [])
+    except TimeoutException:
+        logger.warning("DDG search timed out for query: %s", query)
+    except (requests.RequestException, ConnectionError, OSError) as exc:
+        logger.warning("DDG network error for query %r: %s", query, exc)
     except Exception as exc:
         logger.warning("DDG search failed for query %r: %s", query, exc)
-        return []
+    return []
 
 
 def detect_content_type(query: str) -> str:
@@ -621,7 +628,7 @@ def detect_content_type(query: str) -> str:
     TV show, anime, game, or movie. Defaults to CATEGORY_MOVIE on failure.
     """
     try:
-        with DDGS() as ddgs:
+        with DDGS(timeout=DDG_TIMEOUT_SECONDS) as ddgs:
             results = fetch_ddgs_results(ddgs, f"{query} wikipedia", 5)
         text = " ".join(
             r.get("title", "") + " " + r.get("body", "")
@@ -889,7 +896,7 @@ def search_category_site(title: str, site: str, year: Optional[int] = None,) -> 
         f'{title} streaming site:{site_domain}',
 ])
     try:
-        with DDGS() as ddgs:
+        with DDGS(timeout=DDG_TIMEOUT_SECONDS) as ddgs:
             for query in queries:
                 logger.debug("DDG query: %s", query)
                 results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
@@ -930,7 +937,7 @@ def search_category_sites(title: str, category: str, year: Optional[int] = None,
         return {}
 
     found: Dict[str, str] = {}
-    max_workers = min(6, len(sites))
+    max_workers = min(DDG_MAX_WORKERS, len(sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
             executor.submit(search_category_site, title, site, year): site
