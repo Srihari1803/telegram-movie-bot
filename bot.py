@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -46,10 +47,16 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 mistral_client = Mistral(api_key=MISTRAL_API_KEY) if MISTRAL_API_KEY else None
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Invalid Supabase configuration; using local storage"
+        )
+        supabase = None
+else:
+    supabase = None
 
 # ─── File paths ─────────────────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -230,13 +237,28 @@ def init_db() -> None:
 
 
 def save_history(user_id: int, title: str) -> None:
-    supabase.table("history").insert({
-        "user_id": user_id,
-        "title": title,
-    }).execute()
+    if supabase is not None:
+        supabase.table("history").insert({
+            "user_id": user_id,
+            "title": title,
+        }).execute()
+        return
+    with db_connection(commit=True) as conn:
+        conn.execute(
+            "INSERT INTO history (user_id, title) VALUES (?, ?)",
+            (user_id, title),
+        )
 
 
 def get_history(user_id: int) -> List[Tuple[str, str]]:
+    if supabase is None:
+        with db_connection() as conn:
+            rows = conn.execute(
+                "SELECT title, searched_at FROM history "
+                "WHERE user_id = ? ORDER BY searched_at DESC LIMIT 10",
+                (user_id,),
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
     response = (
         supabase.table("history")
         .select("title,searched_at")
@@ -252,13 +274,27 @@ def get_history(user_id: int) -> List[Tuple[str, str]]:
 
 
 def add_favorite(user_id: int, title: str) -> None:
-    supabase.table("favorites").insert({
-        "user_id": user_id,
-        "title": title,
-    }).execute()
+    if supabase is not None:
+        supabase.table("favorites").insert({
+            "user_id": user_id,
+            "title": title,
+        }).execute()
+        return
+    with db_connection(commit=True) as conn:
+        conn.execute(
+            "INSERT INTO favorites (user_id, title) VALUES (?, ?)",
+            (user_id, title),
+        )
 
 
 def remove_favorite(user_id: int, title: str) -> None:
+    if supabase is None:
+        with db_connection(commit=True) as conn:
+            conn.execute(
+                "DELETE FROM favorites WHERE user_id = ? AND title = ?",
+                (user_id, title),
+            )
+        return
     (
         supabase.table("favorites")
         .delete()
@@ -269,6 +305,13 @@ def remove_favorite(user_id: int, title: str) -> None:
 
 
 def get_favorites(user_id: int) -> List[Tuple[str]]:
+    if supabase is None:
+        with db_connection() as conn:
+            rows = conn.execute(
+                "SELECT title FROM favorites WHERE user_id = ? ORDER BY id DESC",
+                (user_id,),
+            ).fetchall()
+        return [(row[0],) for row in rows]
     response = (
         supabase.table("favorites")
         .select("title")
@@ -288,6 +331,23 @@ def make_cache_key(prefix: str, query: str) -> Optional[str]:
 
 
 def get_cached(cache_key: str) -> Optional[Any]:
+    if supabase is None:
+        with db_connection() as conn:
+            row = conn.execute(
+                "SELECT data, created_at FROM cache WHERE query = ?",
+                (cache_key,),
+            ).fetchone()
+        if not row:
+            return None
+        data, created_at = row
+        if time.time() - int(created_at) > CACHE_DURATION:
+            with db_connection(commit=True) as conn:
+                conn.execute("DELETE FROM cache WHERE query = ?", (cache_key,))
+            return None
+        try:
+            return json.loads(data)
+        except (TypeError, json.JSONDecodeError):
+            return None
     response = (
         supabase.table("cache")
         .select("data,created_at")
@@ -311,11 +371,20 @@ def get_cached(cache_key: str) -> Optional[Any]:
 
     try:
         return json.loads(row["data"])
-    except Exception:
+    except (TypeError, json.JSONDecodeError):
         return None
 
 
 def save_cache(cache_key: str, data: Any) -> None:
+    if supabase is None:
+        with db_connection(commit=True) as conn:
+            conn.execute(
+                "INSERT INTO cache (query, data, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(query) DO UPDATE SET data = excluded.data, "
+                "created_at = excluded.created_at",
+                (cache_key, json.dumps(data), int(time.time())),
+            )
+        return
     supabase.table("cache").upsert({
         "query": cache_key,
         "data": json.dumps(data),
@@ -329,6 +398,12 @@ def cache_empty_result(cache_key: str) -> None:
 
 def cleanup_cache() -> int:
     cutoff = int(time.time()) - CACHE_DURATION
+    if supabase is None:
+        with db_connection(commit=True) as conn:
+            cursor = conn.execute(
+                "DELETE FROM cache WHERE created_at < ?", (cutoff,)
+            )
+            return cursor.rowcount
     response = (
         supabase.table("cache")
         .delete()
@@ -422,14 +497,19 @@ def normalize_site_domain(site: str) -> str:
         return ""
     parsed = urlparse(site)
     domain = parsed.netloc or parsed.path
-    return domain.lower().replace("www.", "")
+    return domain.lower().split(":", 1)[0].removeprefix("www.")
 
 
 def is_valid_http_url(url: str) -> bool:
     if not isinstance(url, str):
         return False
     parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.netloc)
+        and not parsed.username
+        and not parsed.password
+    )
 
 
 def is_valid_title(title: str) -> bool:
@@ -609,7 +689,7 @@ def get_tmdb_info(title: str) -> Optional[Dict[str, Any]]:
     try:
         resp = HTTP_SESSION.get(
             "https://api.themoviedb.org/3/search/multi",
-            params={"api_key": TMDB_API_KEY, "query": title, "include_adult": "true"},
+            params={"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"},
             timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
@@ -827,7 +907,7 @@ def search_category_site(title: str, site: str, year: Optional[int] = None,) -> 
                     path = urlparse(href).path.strip("/")
                     if not path:
                         continue
-                    if site_domain in normalize_site_domain(href):
+                    if normalize_site_domain(href) == site_domain:
                         logger.info("Hit: %s → %s", site_domain, href)
                         return site_domain, href
     except Exception:
@@ -1064,7 +1144,7 @@ def build_results_caption(
 ) -> str:
     label = category_display_label(category)
     if info:
-        display = info.get("title") or raw_title
+        display = html.escape(str(info.get("title") or raw_title))
         caption = f"🎬 <b>{display}"
         year = info.get("year")
         if year:
@@ -1078,9 +1158,12 @@ def build_results_caption(
         if overview:
             if len(overview) > MAX_OVERVIEW_LENGTH:
                 overview = overview[:MAX_OVERVIEW_LENGTH] + "..."
-            caption += f"\n{overview}\n"
+            caption += f"\n{html.escape(str(overview))}\n"
     else:
-        caption = f'🎬 <b>Results for "{raw_title}"</b>\n🧭 Category: {label}\n'
+        caption = (
+            f'🎬 <b>Results for "{html.escape(raw_title)}"</b>\n'
+            f"🧭 Category: {label}\n"
+        )
         
     caption += f"\n⏱ Search Time: {search_time}s"
     caption += "\n🔗 Select a source below:"
@@ -1140,7 +1223,7 @@ def set_active_category(context: ContextTypes.DEFAULT_TYPE, category: str) -> No
 # ════════════════════════════════════════════════════════════════════════════
 
 async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if not update.message or not update.message.from_user:
         return
 
     if not mistral_client:
@@ -1270,7 +1353,10 @@ async def execute_search(
         return
     search_start = time.time()
 
-    await asyncio.to_thread(save_history, update.message.from_user.id, raw_title)
+    try:
+        await asyncio.to_thread(save_history, update.message.from_user.id, raw_title)
+    except Exception:
+        logger.exception("Could not save search history")
     status = await safe_telegram_call(
         update.message.reply_text("🔍 Searching..."),
         "send status",
@@ -1482,7 +1568,12 @@ async def favorites_command(
 ) -> None:
     if not update.message:
         return
-    rows = await asyncio.to_thread(get_favorites, update.message.from_user.id)
+    try:
+        rows = await asyncio.to_thread(get_favorites, update.message.from_user.id)
+    except Exception:
+        logger.exception("Could not load favorites")
+        await update.message.reply_text("❌ Could not load favorites right now.")
+        return
     if not rows:
         await update.message.reply_text("❌ No favorites saved.")
         return
@@ -1506,7 +1597,12 @@ async def favorites_command(
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    rows = await asyncio.to_thread(get_history, update.message.from_user.id)
+    try:
+        rows = await asyncio.to_thread(get_history, update.message.from_user.id)
+    except Exception:
+        logger.exception("Could not load search history")
+        await update.message.reply_text("❌ Could not load history right now.")
+        return
     if not rows:
         await update.message.reply_text("❌ No history found.")
         return
@@ -1895,7 +1991,13 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server() -> None:
-    port = int(os.getenv("PORT", "8080"))
+    try:
+        port = int(os.getenv("PORT", "8080"))
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        logger.error("PORT must be an integer between 1 and 65535")
+        return
 
     server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
 
@@ -1918,6 +2020,7 @@ def main() -> None:
     logger.info("BOT_TOKEN present:    %s", bool(BOT_TOKEN))
     logger.info("TMDB_API_KEY present: %s", bool(TMDB_API_KEY))
     logger.info("MISTRAL_API_KEY present: %s", bool(MISTRAL_API_KEY))
+    logger.info("SUPABASE configured:   %s", supabase is not None)
     logger.info("Working directory:    %s", os.getcwd())
     logger.info("Bot script location:  %s", _BASE_DIR)
     logger.info("DB file:              %s", DB_FILE)
@@ -1926,13 +2029,13 @@ def main() -> None:
 
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing from environment / .env")
-    if not TMDB_API_KEY:
-        raise ValueError("TMDB_API_KEY is missing from environment / .env")
-
     init_db()
-    removed = cleanup_cache()
-    if removed:
-        logger.info("Startup cache cleanup: removed %d stale entries", removed)
+    try:
+        removed = cleanup_cache()
+        if removed:
+            logger.info("Startup cache cleanup: removed %d stale entries", removed)
+    except Exception:
+        logger.exception("Startup cache cleanup failed; continuing")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1967,18 +2070,21 @@ def main() -> None:
 
     # Set Telegram command menu
     async def post_init(application):
-        await application.bot.set_my_commands([
-            BotCommand("start", "Start the bot"),
-            BotCommand("help", "Show help"),
-            BotCommand("ai", "Ask the AI"),
-            BotCommand("movie", "Search for a movie"),
-            BotCommand("tv", "Search for a TV show"),
-            BotCommand("anime", "Search for anime"),
-            BotCommand("game", "Search for a game"),
-            BotCommand("sites", "Show configured sites"),
-            BotCommand("favorites", "Show favorites"),
-            BotCommand("history", "Show search history"),
-        ])
+        try:
+            await application.bot.set_my_commands([
+                BotCommand("start", "Start the bot"),
+                BotCommand("help", "Show help"),
+                BotCommand("ai", "Ask the AI"),
+                BotCommand("movie", "Search for a movie"),
+                BotCommand("tv", "Search for a TV show"),
+                BotCommand("anime", "Search for anime"),
+                BotCommand("game", "Search for a game"),
+                BotCommand("sites", "Show configured sites"),
+                BotCommand("favorites", "Show favorites"),
+                BotCommand("history", "Show search history"),
+            ])
+        except Exception:
+            logger.exception("Could not register Telegram command menu")
 
     app.post_init = post_init
     
