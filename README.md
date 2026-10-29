@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 ### 3. Configure the token
 
-Copy the example env file and fill in your token:
+Copy the example env file and fill in at least the bot token:
 
 ```bash
 cp .env.example .env
@@ -39,8 +39,13 @@ cp .env.example .env
 Open `.env` and replace the placeholder:
 
 ```
-BOT_TOKEN=123456789:ABCdefGhIjKlmNoPQRstuVwXyZ
+BOT_TOKEN=your-telegram-bot-token
 ```
+
+`TMDB_API_KEY` enables metadata and OTT lookups. `SUPABASE_URL` and
+`SUPABASE_KEY` enable shared remote persistence; when they are not set, the bot
+stores history, favorites, and cache in the local, ignored `bot.db` file.
+`MISTRAL_API_KEY` is optional and only enables `/ai`.
 
 ### 4. Run the bot
 
@@ -57,43 +62,29 @@ You should see:
 
 ## Usage
 
-### Add sites first
+### Search a title
 
 ```
-/addsite https://www.example-movies.com
-/addsite https://another-site.com
+/movie Inception
+/tv Breaking Bad
+/anime Attack on Titan
+/game GTA 5
 ```
 
-### Search for a title
-
-```
-/search Inception
-/search Breaking Bad
-/search The Dark Knight
-```
-
-The bot will return one direct link per site where it found a match.
+The bot also accepts a plain-text title and detects its category automatically.
 
 ### View and manage your sites
 
-```
-/listsites
-/removesite https://www.example-movies.com
-```
+Use `/sites`, `/favorites`, and `/history` to inspect configured sites and
+your saved data.
 
 ---
 
 ## How the search works
 
-For each saved site, the bot tries common search URL patterns such as:
-
-- `/?s=title`
-- `/search?q=title`
-- `/search/title/`
-- `/?q=title`
-- and more…
-
-It then parses the resulting page, scores all links by how well they match the title (by slug, text, word overlap), and returns the best match. Links with low confidence are discarded.
+For each configured site, the bot queries DuckDuckGo and only accepts HTTPS or
+HTTP result links whose hostname exactly matches the configured hostname.
+Searches use bounded request timeouts and run in parallel. Links with low confidence are discarded.
 
 ---
 
@@ -101,5 +92,5 @@ It then parses the resulting page, scores all links by how well they match the t
 
 - Sites must have a publicly accessible search page (no login required)
 - The bot searches sites in parallel for speed
-- `sites.json` is created automatically in the same folder as `bot.py`
+- `sites.json` is read from the same folder as `bot.py`
 - You can keep the bot running 24/7 on a VPS, Raspberry Pi, or any server
