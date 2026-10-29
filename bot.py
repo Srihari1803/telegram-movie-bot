@@ -789,7 +789,7 @@ def search_ott(
 # Site search (parallelised per-category)
 # ════════════════════════════════════════════════════════════════════════════
 
-def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
+def search_category_site(title: str, site: str, year: Optional[int] = None,) -> Optional[Tuple[str, str]]:
     """
     Search a single site for *title*.
     Returns (domain, url) on success, None otherwise.
@@ -797,11 +797,16 @@ def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
     site_domain = normalize_site_domain(site)
     if not site_domain:
         return None
-    queries = [
+    queries = []
+
+    if year:
+        queries.append(f'"{title}" {year} site:{site_domain}')
+
+    queries.extend([
         f'"{title}" site:{site_domain}',
         f'{title} watch online site:{site_domain}',
         f'{title} streaming site:{site_domain}',
-    ]
+])
     try:
         with DDGS() as ddgs:
             for query in queries:
