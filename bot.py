@@ -529,8 +529,8 @@ def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[st
     try:
         raw = ddgs.text(query, max_results=max_results)
         return list(raw or [])
-    except Exception:
-        logger.warning("DDG search failed for query: %s", query)
+    except Exception as exc:
+        logger.warning("DDG search failed for query %r: %s" query, exc)
         return []
 
 
@@ -836,7 +836,7 @@ def search_category_site(title: str, site: str, year: Optional[int] = None,) -> 
     return None
 
 
-def search_category_sites(title: str, category: str) -> Dict[str, str]:
+def search_category_sites(title: str, category: str, year: Optional[int] = None,) -> Dict[str, str]:
     """
     Search all sites for *category* in parallel using a thread pool.
     Returns a dict of {domain: url}.
@@ -849,10 +849,10 @@ def search_category_sites(title: str, category: str) -> Dict[str, str]:
         return {}
 
     found: Dict[str, str] = {}
-    max_workers = min(20, len(sites))
+    max_workers = min(6, len(sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
-            executor.submit(search_category_site, title, site): site
+            executor.submit(search_category_site, title, site, year): site
             for site in sites
         }
         for future in as_completed(future_to_site):
@@ -1295,8 +1295,15 @@ async def execute_search(
         if cached is not None:
             results = resolve_cached_category_results(cached)
         else:
+            year = info.get("year") if info else None
+
+            if isinstance(year, str) and year.isdigit():
+                year = int(year)
+            
+            context.user_data["current_year"] = year
+                
             all_results = await asyncio.to_thread(
-                search_category_sites, title, detected_category
+                search_category_sites, title, detected_category, year
             )
             results = all_results
             logger.info("TOTAL RESULTS FOUND = %s", len(results))
@@ -1623,8 +1630,10 @@ async def favorite_callback(
                 if cached is not None:
                     new_results = resolve_cached_category_results(cached)
                 else:
+                    year = context.user_data.get("current_year")
+                    
                     new_results = await asyncio.to_thread(
-                        search_category_sites, title, category
+                        search_category_sites, title, category, year
                     )
                     if cache_key:
                         await asyncio.to_thread(
