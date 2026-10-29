@@ -20,7 +20,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 from ddgs import DDGS
-from ddgs.exceptions import TimeoutException
+from ddgs.exceptions import DDGSException, TimeoutException
 from supabase import create_client
 from telegram import (
     Update,
@@ -86,15 +86,27 @@ HTTP_POOL_SIZE = 20
 DDG_TIMEOUT_SECONDS = 8
 DDG_MAX_ATTEMPTS = 2
 DDG_RETRY_BACKOFF_SECONDS = 1
+DDG_PROVIDER_COOLDOWN_SECONDS = 300
+DDG_PROVIDER_FAILURE_THRESHOLD = 2
+DDG_BACKENDS = tuple(
+    backend.strip()
+    for backend in os.getenv("DDG_BACKENDS", "yahoo,wikipedia,grokipedia").split(",")
+    if backend.strip()
+)
 
 CACHE_PREFIX_MOVIE = "movie"
 CACHE_PREFIX_OTT = "ott"
 CACHE_PREFIX_TMDB = "tmdb"
 CACHE_PREFIX_DETECT = "detect"
+CACHE_PREFIX_SITE = "site"
 CACHE_EMPTY_MARKER: Dict[str, bool] = {"_empty": True}
 
 SUPPORTED_TMDB_MEDIA_TYPES: Set[str] = {"movie", "tv"}
 MAX_TMDB_RATING = 10
+
+_ddg_provider_lock = threading.Lock()
+_ddg_provider_failures: Dict[str, int] = {}
+_ddg_provider_cooldowns: Dict[str, float] = {}
 
 # ─── Categories ─────────────────────────────────────────────────────────────
 CATEGORY_MOVIE = "movie"
@@ -609,37 +621,159 @@ def load_category_sites() -> Dict[str, List[str]]:
 # Category detection
 # ════════════════════════════════════════════════════════════════════════════
 
-def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[str, Any]]:
-    """Materialise DDG results into a list; return [] on any failure."""
+def _provider_is_on_cooldown(provider: str) -> bool:
+    now = time.time()
+    with _ddg_provider_lock:
+        cooldown_until = _ddg_provider_cooldowns.get(provider, 0)
+        if cooldown_until > now:
+            return True
+        if cooldown_until:
+            _ddg_provider_cooldowns.pop(provider, None)
+            _ddg_provider_failures.pop(provider, None)
+    return False
+
+
+def _record_provider_failure(provider: str, status: str) -> None:
+    with _ddg_provider_lock:
+        failures = _ddg_provider_failures.get(provider, 0) + 1
+        _ddg_provider_failures[provider] = failures
+        should_cooldown = (
+            status in {"403", "429", "captcha", "blocked"}
+            or failures >= DDG_PROVIDER_FAILURE_THRESHOLD
+        )
+        if should_cooldown:
+            _ddg_provider_cooldowns[provider] = (
+                time.time() + DDG_PROVIDER_COOLDOWN_SECONDS
+            )
+            logger.warning(
+                "Search provider: %s | Status: %s | Action: cooldown (%ds)",
+                provider,
+                status,
+                DDG_PROVIDER_COOLDOWN_SECONDS,
+            )
+        else:
+            logger.warning(
+                "Search provider: %s | Status: %s | Action: retry later",
+                provider,
+                status,
+            )
+
+
+def _record_provider_success(provider: str, result_count: int) -> None:
+    with _ddg_provider_lock:
+        _ddg_provider_failures.pop(provider, None)
+    logger.info(
+        "Search provider: %s | Status: success | Results: %d",
+        provider,
+        result_count,
+    )
+
+
+def _classify_provider_error(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "captcha" in message:
+        return "captcha"
+    if "429" in message or "rate limit" in message:
+        return "429"
+    if "403" in message or "forbidden" in message:
+        return "403"
+    if isinstance(exc, TimeoutException) or "timed out" in message:
+        return "timeout"
+    if isinstance(exc, (requests.RequestException, ConnectionError, OSError)):
+        return "connection"
+    return "error"
+
+
+def fetch_ddgs_results(
+    ddgs: DDGS,
+    query: str,
+    max_results: int,
+    backend: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch one provider safely; return [] after bounded failure handling."""
+    provider = backend or "ddgs"
+    if _provider_is_on_cooldown(provider):
+        logger.info(
+            "Search provider: %s | Status: cooldown | Action: skipped",
+            provider,
+        )
+        return []
+
     for attempt in range(1, DDG_MAX_ATTEMPTS + 1):
         try:
-            raw = ddgs.text(query, max_results=max_results)
-            return list(raw or [])
-        except TimeoutException:
+            kwargs: Dict[str, Any] = {"max_results": max_results}
+            if backend:
+                kwargs["backend"] = backend
+            raw = ddgs.text(query, **kwargs)
+            results = list(raw or [])
+            if results:
+                _record_provider_success(provider, len(results))
+            else:
+                logger.info(
+                    "Search provider: %s | Status: empty | Action: next provider",
+                    provider,
+                )
+            return results
+        except (TimeoutException, DDGSException, requests.RequestException,
+                ConnectionError, OSError) as exc:
+            status = _classify_provider_error(exc)
+            if status == "timeout":
+                logger.warning("DDG search timed out for query: %s", query)
             logger.warning(
-                "DDG search timed out for query: %s (attempt %d/%d)",
+                "Search provider: %s | Status: %s | Query: %s | Attempt: %d/%d",
+                provider,
+                status,
                 query,
                 attempt,
                 DDG_MAX_ATTEMPTS,
             )
-        except (requests.RequestException, ConnectionError, OSError) as exc:
-            logger.warning(
-                "DDG network error for query %r (attempt %d/%d): %s",
-                query,
-                attempt,
-                DDG_MAX_ATTEMPTS,
-                exc,
-            )
+            if status in {"403", "429", "captcha", "blocked"}:
+                _record_provider_failure(provider, status)
+                return []
         except Exception as exc:
-            logger.warning(
-                "DDG search failed for query %r (attempt %d/%d): %s",
+            status = _classify_provider_error(exc)
+            logger.exception(
+                "Search provider: %s | Status: %s | Query: %s",
+                provider,
+                status,
                 query,
-                attempt,
-                DDG_MAX_ATTEMPTS,
-                exc,
             )
+            _record_provider_failure(provider, status)
+            return []
         if attempt < DDG_MAX_ATTEMPTS:
             time.sleep(DDG_RETRY_BACKOFF_SECONDS)
+    _record_provider_failure(provider, status)
+    return []
+
+
+def fetch_search_provider_results(
+    query: str,
+    max_results: int,
+    result_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+) -> List[Dict[str, Any]]:
+    """Query configured providers sequentially, skipping cooled-down ones."""
+    try:
+        with DDGS(timeout=DDG_TIMEOUT_SECONDS) as ddgs:
+            for backend in DDG_BACKENDS:
+                results = fetch_ddgs_results(
+                    ddgs,
+                    query,
+                    max_results,
+                    backend=backend,
+                )
+                if results and (
+                    result_filter is None
+                    or any(result_filter(item) for item in results)
+                ):
+                    return results
+                if results and result_filter is not None:
+                    logger.info(
+                        "Search provider: %s | Status: non-useful | "
+                        "Action: next provider",
+                        backend,
+                    )
+    except Exception:
+        logger.exception("Search provider layer failed for query: %s", query)
     return []
 
 
@@ -649,8 +783,7 @@ def detect_content_type(query: str) -> str:
     TV show, anime, game, or movie. Defaults to CATEGORY_MOVIE on failure.
     """
     try:
-        with DDGS(timeout=DDG_TIMEOUT_SECONDS) as ddgs:
-            results = fetch_ddgs_results(ddgs, f"{query} wikipedia", 5)
+        results = fetch_search_provider_results(f"{query} wikipedia", 5)
         text = " ".join(
             r.get("title", "") + " " + r.get("body", "")
             for r in results
@@ -906,38 +1039,58 @@ def search_category_site(title: str, site: str, year: Optional[int] = None,) -> 
     site_domain = normalize_site_domain(site)
     if not site_domain:
         return None
-    queries = []
+    cache_key = make_cache_key(
+        CACHE_PREFIX_SITE,
+        f"{title}|{year or ''}|{site_domain}",
+    )
+    if cache_key:
+        cached = get_cached(cache_key)
+        if isinstance(cached, dict) and cached.get("url"):
+            return site_domain, str(cached["url"])
+        if is_empty_cache(cached):
+            return None
 
-    if year:
-        queries.append(f'"{title}" {year} site:{site_domain}')
-
+    queries = (
+        [f'"{title}" {year} site:{site_domain}']
+        if year
+        else [f'"{title}" site:{site_domain}']
+    )
     queries.extend([
         f'"{title}" site:{site_domain}',
         f'{title} watch online site:{site_domain}',
-        f'{title} streaming site:{site_domain}',
-])
+    ])
+
+    def is_site_result(item: Dict[str, Any]) -> bool:
+        href = item.get("href") or item.get("url")
+        if not href or not is_valid_http_url(href):
+            return False
+        return (
+            bool(urlparse(href).path.strip("/"))
+            and normalize_site_domain(href) == site_domain
+        )
+
     try:
-        with DDGS(timeout=DDG_TIMEOUT_SECONDS) as ddgs:
-            for query in queries:
-                logger.debug("DDG query: %s", query)
-                results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
-                logger.info("QUERY: %s", query)
-                logger.info("RESULTS COUNT: %d", len(results))
-                for r in results[:3]:
-                    logger.info("RESULT: %s", r)
-                logger.debug("DDG returned %d results for %s", len(results), site_domain)
-                for item in results:
-                    href = item.get("href") or item.get("url")
-                    logger.info("FOUND URL: %s", href)
-                    if not href or not is_valid_http_url(href):
-                        continue
-                    # Skip homepages — must have a non-empty path beyond "/"
-                    path = urlparse(href).path.strip("/")
-                    if not path:
-                        continue
-                    if normalize_site_domain(href) == site_domain:
-                        logger.info("Hit: %s → %s", site_domain, href)
-                        return site_domain, href
+        for query in queries:
+            logger.debug("DDG query: %s", query)
+            results = fetch_search_provider_results(
+                query,
+                MAX_SEARCH_RESULTS,
+                result_filter=is_site_result,
+            )
+            for item in results:
+                href = item.get("href") or item.get("url")
+                if not href or not is_valid_http_url(href):
+                    continue
+                path = urlparse(href).path.strip("/")
+                if not path or normalize_site_domain(href) != site_domain:
+                    continue
+                logger.info("Search provider result: %s -> %s", site_domain, href)
+                if cache_key:
+                    save_cache(
+                        cache_key,
+                        {"domain": site_domain, "url": href},
+                    )
+                return site_domain, href
     except Exception:
         logger.exception(
             "search_category_site failed: title=%s site=%s", title, site_domain

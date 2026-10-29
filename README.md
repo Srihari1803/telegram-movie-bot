@@ -46,6 +46,12 @@ BOT_TOKEN=your-telegram-bot-token
 `SUPABASE_KEY` enable shared remote persistence; when they are not set, the bot
 stores history, favorites, and cache in the local, ignored `bot.db` file.
 `MISTRAL_API_KEY` is optional and only enables `/ai`.
+The search layer uses the ordered `DDG_BACKENDS` list (default:
+`yahoo,wikipedia,grokipedia`) and queries one backend at a time. Add
+`duckduckgo` only if it is available from your deployment network. No general
+search API key is currently configured in this project; adding one would
+require wiring its credentials through a new environment variable and API
+client.
 
 ### 4. Run the bot
 
