@@ -1876,7 +1876,9 @@ def start_fallback_cleanup_thread() -> None:
         daemon=True,
     )
     _cleanup_thread.start()
-    class HealthHandler(BaseHTTPRequestHandler):
+
+    
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
