@@ -530,7 +530,7 @@ def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[st
         raw = ddgs.text(query, max_results=max_results)
         return list(raw or [])
     except Exception as exc:
-        logger.warning("DDG search failed for query %r: %s" query, exc)
+        logger.warning("DDG search failed for query %r: %s", query, exc)
         return []
 
 
