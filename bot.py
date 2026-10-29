@@ -619,28 +619,38 @@ def load_category_sites() -> Dict[str, List[str]]:
 # Category detection
 # ════════════════════════════════════════════════════════════════════════════
 
-def _provider_is_on_cooldown(provider: str) -> bool:
+def _provider_cooldown_until(provider: str) -> Optional[float]:
     now = time.time()
     with _ddg_provider_lock:
         cooldown_until = _ddg_provider_cooldowns.get(provider, 0)
         if cooldown_until > now:
-            return True
+            return cooldown_until
         if cooldown_until:
             _ddg_provider_cooldowns.pop(provider, None)
             _ddg_provider_failures.pop(provider, None)
-    return False
+    return None
 
 
 def _available_search_backends() -> Tuple[str, ...]:
-    available = tuple(
-        backend for backend in DDG_BACKENDS
-        if not _provider_is_on_cooldown(backend)
-    )
+    available: List[str] = []
+    for backend in DDG_BACKENDS:
+        cooldown_until = _provider_cooldown_until(backend)
+        if cooldown_until is not None:
+            logger.info(
+                "Search provider %s: cooldown until %s",
+                backend,
+                time.strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                    time.localtime(cooldown_until),
+                ),
+            )
+            continue
+        available.append(backend)
     logger.info(
-        "Search providers available for this search: %s",
+        "Search providers available: %s",
         ", ".join(available) if available else "none",
     )
-    return available
+    return tuple(available)
 
 
 def _record_provider_failure(provider: str, status: str) -> None:
@@ -750,6 +760,7 @@ def fetch_search_provider_results(
     available_backends: Optional[Tuple[str, ...]] = None,
     blocked_backends: Optional[Set[str]] = None,
     blocked_lock: Optional[threading.Lock] = None,
+    searching_backends: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Query one shared provider set sequentially for this search."""
     backends = (
@@ -759,6 +770,7 @@ def fetch_search_provider_results(
     )
     blocked = blocked_backends if blocked_backends is not None else set()
     lock = blocked_lock or threading.Lock()
+    searching = searching_backends if searching_backends is not None else set()
 
     def mark_failed(provider: str) -> None:
         with lock:
@@ -770,6 +782,9 @@ def fetch_search_provider_results(
                 with lock:
                     if backend in blocked:
                         continue
+                    if backend not in searching:
+                        logger.info("Search provider %s: searching", backend)
+                        searching.add(backend)
                 results = fetch_ddgs_results(
                     ddgs,
                     query,
@@ -1077,6 +1092,7 @@ def search_category_site(
     available_backends: Optional[Tuple[str, ...]] = None,
     blocked_backends: Optional[Set[str]] = None,
     blocked_lock: Optional[threading.Lock] = None,
+    searching_backends: Optional[Set[str]] = None,
 ) -> Optional[Tuple[str, str]]:
     """
     Search a single site for *title*.
@@ -1119,6 +1135,7 @@ def search_category_site(
                 available_backends=available_backends,
                 blocked_backends=blocked_backends,
                 blocked_lock=blocked_lock,
+                searching_backends=searching_backends,
             )
             for item in results:
                 href = item.get("href") or item.get("url")
@@ -1207,6 +1224,7 @@ def search_category_sites(
 
     blocked_backends: Set[str] = set()
     blocked_lock = threading.Lock()
+    searching_backends: Set[str] = set()
     max_workers = min(2, len(uncached_sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
@@ -1218,6 +1236,7 @@ def search_category_sites(
                 available_backends,
                 blocked_backends,
                 blocked_lock,
+                searching_backends,
             ): site
             for site in uncached_sites
         }
