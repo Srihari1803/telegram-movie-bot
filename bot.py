@@ -13,7 +13,7 @@ from mistralai.client import Mistral
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from typing import Any, Awaitable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -84,7 +84,8 @@ TOKEN_CACHE_LIMIT = 25
 HTTP_TIMEOUT: Tuple[int, int] = (5, 15)   # (connect, read)
 HTTP_POOL_SIZE = 20
 DDG_TIMEOUT_SECONDS = 8
-DDG_MAX_WORKERS = 4
+DDG_MAX_ATTEMPTS = 2
+DDG_RETRY_BACKOFF_SECONDS = 1
 
 CACHE_PREFIX_MOVIE = "movie"
 CACHE_PREFIX_OTT = "ott"
@@ -610,15 +611,35 @@ def load_category_sites() -> Dict[str, List[str]]:
 
 def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[str, Any]]:
     """Materialise DDG results into a list; return [] on any failure."""
-    try:
-        raw = ddgs.text(query, max_results=max_results)
-        return list(raw or [])
-    except TimeoutException:
-        logger.warning("DDG search timed out for query: %s", query)
-    except (requests.RequestException, ConnectionError, OSError) as exc:
-        logger.warning("DDG network error for query %r: %s", query, exc)
-    except Exception as exc:
-        logger.warning("DDG search failed for query %r: %s", query, exc)
+    for attempt in range(1, DDG_MAX_ATTEMPTS + 1):
+        try:
+            raw = ddgs.text(query, max_results=max_results)
+            return list(raw or [])
+        except TimeoutException:
+            logger.warning(
+                "DDG search timed out for query: %s (attempt %d/%d)",
+                query,
+                attempt,
+                DDG_MAX_ATTEMPTS,
+            )
+        except (requests.RequestException, ConnectionError, OSError) as exc:
+            logger.warning(
+                "DDG network error for query %r (attempt %d/%d): %s",
+                query,
+                attempt,
+                DDG_MAX_ATTEMPTS,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "DDG search failed for query %r (attempt %d/%d): %s",
+                query,
+                attempt,
+                DDG_MAX_ATTEMPTS,
+                exc,
+            )
+        if attempt < DDG_MAX_ATTEMPTS:
+            time.sleep(DDG_RETRY_BACKOFF_SECONDS)
     return []
 
 
@@ -924,7 +945,12 @@ def search_category_site(title: str, site: str, year: Optional[int] = None,) -> 
     return None
 
 
-def search_category_sites(title: str, category: str, year: Optional[int] = None,) -> Dict[str, str]:
+def search_category_sites(
+    title: str,
+    category: str,
+    year: Optional[int] = None,
+    progress_callback: Optional[Callable[[str, str], None]] = None,
+) -> Dict[str, str]:
     """
     Search all sites for *category* in parallel using a thread pool.
     Returns a dict of {domain: url}.
@@ -937,7 +963,7 @@ def search_category_sites(title: str, category: str, year: Optional[int] = None,
         return {}
 
     found: Dict[str, str] = {}
-    max_workers = min(DDG_MAX_WORKERS, len(sites))
+    max_workers = min(2, len(sites))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_site = {
             executor.submit(search_category_site, title, site, year): site
@@ -958,6 +984,13 @@ def search_category_sites(title: str, category: str, year: Optional[int] = None,
                 domain, href = result
                 logger.info("SAVING: %s -> %s", domain, href)
                 found[domain] = href
+                if progress_callback:
+                    try:
+                        progress_callback(domain, href)
+                    except Exception:
+                        logger.exception(
+                            "Search progress callback failed for %s", domain
+                        )
 
     logger.info(
         "search_category_sites: found %d results for %s", len(found), title
@@ -1368,6 +1401,35 @@ async def execute_search(
         update.message.reply_text("🔍 Searching..."),
         "send status",
     )
+    progress_lines: List[str] = []
+    progress_lock = threading.Lock()
+    progress_loop = asyncio.get_running_loop()
+
+    async def publish_search_progress(domain: str, href: str) -> None:
+        if not status:
+            return
+        with progress_lock:
+            line = f"✅ {domain}\n{href}"
+            if line in progress_lines:
+                return
+            progress_lines.append(line)
+            # Keep progress messages below Telegram's message-size limit.
+            visible_lines = progress_lines[-20:]
+        await safe_telegram_call(
+            status.edit_text(
+                "🔍 Searching...\n\n" + "\n\n".join(visible_lines),
+                disable_web_page_preview=True,
+            ),
+            "update search progress",
+        )
+
+    def report_search_progress(domain: str, href: str) -> None:
+        if status:
+            progress_loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(
+                    publish_search_progress(domain, href)
+                )
+            )
 
     try:
         parsed = parse_advanced_query(raw_title)
@@ -1397,7 +1459,11 @@ async def execute_search(
             context.user_data["current_year"] = year
                 
             all_results = await asyncio.to_thread(
-                search_category_sites, title, detected_category, year
+                search_category_sites,
+                title,
+                detected_category,
+                year,
+                report_search_progress,
             )
             results = all_results
             logger.info("TOTAL RESULTS FOUND = %s", len(results))
