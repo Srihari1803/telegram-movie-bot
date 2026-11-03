@@ -1,117 +1,356 @@
+"""Small Telegram movie search bot with no third-party runtime dependencies."""
+
+from __future__ import annotations
+
+import html
+import json
+import logging
+import os
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.request import Request, urlopen
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_FILE = BASE_DIR / "bot.db"
+SITES_FILE = BASE_DIR / "sites.json"
+LOGGER = logging.getLogger("movie-bot")
+TELEGRAM_API = "https://api.telegram.org/bot{}/{}"
+REQUEST_TIMEOUT = 12
+CACHE_TTL = 3600
+MAX_SEARCH_SITES = 8
+MAX_RESULTS = 5
+
+
+def load_env() -> None:
+    """Load a local .env without requiring python-dotenv."""
+    env_file = BASE_DIR / ".env"
+    if not env_file.is_file():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+load_env()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+
+
+def db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_FILE, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS history "
+        "(chat_id INTEGER, title TEXT, category TEXT, created_at INTEGER)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS favorites "
+        "(chat_id INTEGER, title TEXT, url TEXT, created_at INTEGER, "
+        "PRIMARY KEY (chat_id, title, url))"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS cache "
+        "(query TEXT PRIMARY KEY, response TEXT, created_at INTEGER)"
+    )
+    connection.commit()
+    return connection
+
+
+def load_sites() -> dict[str, list[str]]:
+    try:
+        data = json.loads(SITES_FILE.read_text(encoding="utf-8"))
+        return {
+            key: [url for url in urls if valid_site(url)]
+            for key, urls in data.items()
+            if isinstance(urls, list)
+        }
+    except (OSError, ValueError) as exc:
+        LOGGER.error("Could not read %s: %s", SITES_FILE, exc)
+        return {}
+
+
+def valid_site(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+SITES = load_sites()
+
+
+class LinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[tuple[str, str]] = []
+        self.current_href = ""
+        self.current_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "a":
+            self.current_href = dict(attrs).get("href") or ""
+            self.current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self.current_href:
+            self.current_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "a" and self.current_href:
+            text = " ".join("".join(self.current_text).split())
+            self.links.append((self.current_href, text))
+            self.current_href = ""
+
+
+def fetch(url: str) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "telegram-movie-bot/1.0 (+Raspberry Pi)",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        return response.read(512_000).decode("utf-8", errors="replace")
+
+
+def search_site(site: str, title: str, category: str) -> list[tuple[str, str]]:
+    parsed = urlparse(site)
+    domain = parsed.netloc.lower().split(":")[0]
+    search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'site:{domain} {title}')}"
+    try:
+        parser = LinkParser()
+        parser.feed(fetch(search_url))
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        LOGGER.debug("Search failed for %s: %s", domain, exc)
+        return []
+    results = []
+    for href, text in parser.links:
+        absolute = urljoin(search_url, href)
+        parsed_result = urlparse(absolute)
+        if parsed_result.netloc.lower().endswith("duckduckgo.com"):
+            redirected = parse_qs(parsed_result.query).get("uddg", [])
+            if redirected:
+                absolute = redirected[0]
+        result_domain = urlparse(absolute).netloc.lower().split(":")[0]
+        if result_domain != domain or not absolute.startswith(("http://", "https://")):
+            continue
+        label = text or title
+        if absolute not in {url for url, _ in results}:
+            results.append((absolute, label[:120]))
+    return results[:2]
+
+
+def search(title: str, category: str) -> list[tuple[str, str]]:
+    key = f"{category}:{title.lower().strip()}"
+    connection = db()
+    row = connection.execute(
+        "SELECT response, created_at FROM cache WHERE query = ?", (key,)
+    ).fetchone()
+    if row and int(time.time()) - row[1] < CACHE_TTL:
+        connection.close()
+        return [tuple(item) for item in json.loads(row[0])]
+
+    sites = SITES.get(category, [])[:MAX_SEARCH_SITES]
+    results: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(sites)))) as pool:
+        futures = [pool.submit(search_site, site, title, category) for site in sites]
+        for future in as_completed(futures):
+            results.extend(future.result())
+            if len(results) >= MAX_RESULTS:
+                break
+    results = results[:MAX_RESULTS]
+    connection.execute(
+        "INSERT OR REPLACE INTO cache(query, response, created_at) VALUES (?, ?, ?)",
+        (key, json.dumps(results), int(time.time())),
+    )
+    connection.execute(
+        "INSERT INTO history(chat_id, title, category, created_at) VALUES (?, ?, ?, ?)",
+        (0, title, category, int(time.time())),
+    )
+    connection.commit()
+    connection.close()
+    return results
+
+
+def telegram(method: str, **params: object) -> object:
+    request = Request(
+        TELEGRAM_API.format(BOT_TOKEN, method),
+        data=json.dumps(params).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    api_timeout = max(REQUEST_TIMEOUT + 10, int(params.get("timeout", 0)) + 10)
+    with urlopen(request, timeout=api_timeout) as response:
+        payload = json.loads(response.read().decode())
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("description", "Telegram API request failed"))
+    return payload.get("result")
+
+
+def send(chat_id: int, text: str) -> None:
+    telegram("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True)
+
+
+def escape(text: str) -> str:
+    return html.escape(text, quote=False)
+
+
+def category_command(command: str) -> str:
+    return {"movie": "movie", "tv": "tv", "anime": "anime", "game": "game"}.get(
+        command, "movie"
+    )
+
+
+def handle_message(message: dict) -> None:
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    text = (message.get("text") or "").strip()
+    if not isinstance(chat_id, int) or not text:
+        return
+    command, _, argument = text.partition(" ")
+    command = command.lstrip("/").split("@", 1)[0].lower()
+    if command in {"start", "help"}:
+        send(
+            chat_id,
+            "Send a title or use /movie, /tv, /anime, or /game followed by a title.\n"
+            "Save a result with /favorite <title> | <url>.",
+        )
+        return
+    if command == "sites":
+        counts = ", ".join(f"{key}: {len(value)}" for key, value in SITES.items())
+        send(chat_id, f"Configured search sites: {counts or 'none'}")
+        return
+    if command == "favorite":
+        if "|" not in argument:
+            send(chat_id, "Usage: /favorite <title> | <url>")
+            return
+        title, url = (part.strip() for part in argument.split("|", 1))
+        if not title or not valid_site(url):
+            send(chat_id, "Provide a title and a valid http(s) URL.")
+            return
+        connection = db()
+        connection.execute(
+            "INSERT OR IGNORE INTO favorites(chat_id, title, url, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, title, url, int(time.time())),
+        )
+        connection.commit()
+        connection.close()
+        send(chat_id, "Saved to favorites.")
+        return
+    if command in {"favorites", "history"}:
+        connection = db()
+        if command == "favorites":
+            rows = connection.execute(
+                "SELECT title, url FROM favorites WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
+                (chat_id,),
+            ).fetchall()
+            reply = "\n".join(f"{escape(title)}\n{url}" for title, url in rows) or "No favorites yet."
+        else:
+            rows = connection.execute(
+                "SELECT title, category FROM history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
+                (chat_id,),
+            ).fetchall()
+            reply = "\n".join(f"{escape(category)}: {escape(title)}" for title, category in rows) or "No search history yet."
+        connection.close()
+        send(chat_id, reply)
+        return
+    category = category_command(command) if command in {"movie", "tv", "anime", "game"} else "movie"
+    title = argument.strip() if command in {"movie", "tv", "anime", "game"} else text
+    if not title:
+        send(chat_id, f"Usage: /{category} <title>")
+        return
+    send(chat_id, f"Searching for {title}...")
+    try:
+        results = search(title, category)
+        connection = db()
+        connection.execute(
+            "INSERT INTO history(chat_id, title, category, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, title, category, int(time.time())),
+        )
+        connection.commit()
+        connection.close()
+        if results:
+            send(chat_id, "\n\n".join(f"{escape(label)}\n{url}" for url, label in results))
+        else:
+            send(chat_id, "No matching links found. Try a different title.")
+    except (HTTPError, URLError, RuntimeError, sqlite3.Error) as exc:
+        LOGGER.warning("Request failed for chat %s: %s", chat_id, exc)
+        send(chat_id, "The search service is temporarily unavailable. Please try again.")
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+
+    def log_message(self, *_args: object) -> None:
+        return
+
+
 def start_health_server() -> None:
     try:
         port = int(os.getenv("PORT", "8080"))
         if not 1 <= port <= 65535:
             raise ValueError
-    except ValueError:
-        logger.error("PORT must be an integer between 1 and 65535")
-        return
+        server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+        LOGGER.info("Health server listening on port %d", port)
+        server.serve_forever()
+    except (OSError, ValueError) as exc:
+        LOGGER.warning("Health server disabled: %s", exc)
 
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-
-    logger.info("Health server listening on port %d", port)
-
-    server.serve_forever()
-
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s | %(levelname)s | %(message)s",
     )
-    logger.info("✅ Bot starting up...")
-    logger.info("BOT_TOKEN present:    %s", bool(BOT_TOKEN))
-    logger.info("TMDB_API_KEY present: %s", bool(TMDB_API_KEY))
-    logger.info("MISTRAL_API_KEY present: %s", bool(MISTRAL_API_KEY))
-    logger.info("SUPABASE configured:   %s", supabase is not None)
-    logger.info("Working directory:    %s", os.getcwd())
-    logger.info("Bot script location:  %s", _BASE_DIR)
-    logger.info("DB file:              %s", DB_FILE)
-    logger.info("sites.json path:      %s", SITES_FILE)
-    logger.info("sites.json exists:    %s", os.path.isfile(SITES_FILE))
-
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is missing from environment / .env")
-    init_db()
-    try:
-        removed = cleanup_cache()
-        if removed:
-            logger.info("Startup cache cleanup: removed %d stale entries", removed)
-    except Exception:
-        logger.exception("Startup cache cleanup failed; continuing")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",     start))
-    app.add_handler(CommandHandler("help",      help_command))
-    app.add_handler(CommandHandler("ai",        ai_command))
-    app.add_handler(CommandHandler("sites",     sites_command))
-    app.add_handler(CommandHandler("movie",     movie_command))
-    app.add_handler(CommandHandler("tv",        tv_command))
-    app.add_handler(CommandHandler("anime",     anime_command))
-    app.add_handler(CommandHandler("game",      game_command))
-    app.add_handler(CommandHandler("favorites", favorites_command))
-    app.add_handler(CommandHandler("history",   history_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_title))
-    app.add_handler(CallbackQueryHandler(favorite_callback))
-
-    if app.job_queue is not None:
-        app.job_queue.run_repeating(
-            cleanup_cache_job,
-            interval=CACHE_CLEANUP_INTERVAL,
-            first=CACHE_CLEANUP_INTERVAL,
-        )
-        logger.info(
-            "JobQueue cache-cleanup scheduled every %ds", CACHE_CLEANUP_INTERVAL
-        )
-    else:
-        logger.warning(
-            "JobQueue not available (install python-telegram-bot[job-queue] for "
-            "scheduled cleanup). Falling back to daemon thread."
-        )
-        start_fallback_cleanup_thread()
-
-    # Set Telegram command menu
-    async def post_init(application):
-        try:
-            await application.bot.set_my_commands([
-                BotCommand("start", "Start the bot"),
-                BotCommand("help", "Show help"),
-                BotCommand("ai", "Ask the AI"),
-                BotCommand("movie", "Search for a movie"),
-                BotCommand("tv", "Search for a TV show"),
-                BotCommand("anime", "Search for anime"),
-                BotCommand("game", "Search for a game"),
-                BotCommand("sites", "Show configured sites"),
-                BotCommand("favorites", "Show favorites"),
-                BotCommand("history", "Show search history"),
-            ])
-        except Exception:
-            logger.exception("Could not register Telegram command menu")
-
-    app.post_init = post_init
-    
-    health_thread = threading.Thread(
-        target=start_health_server,
-        daemon=True,
-        name="health-server",
+        raise RuntimeError("BOT_TOKEN is missing from .env or the environment")
+    db().close()
+    threading.Thread(target=start_health_server, daemon=True, name="health").start()
+    telegram(
+        "setMyCommands",
+        commands=[
+            {"command": command, "description": description}
+            for command, description in (
+                ("start", "Show help"),
+                ("movie", "Search for a movie"),
+                ("tv", "Search for a TV show"),
+                ("anime", "Search for anime"),
+                ("game", "Search for a game"),
+                ("sites", "Show configured sites"),
+                ("favorites", "Show favorites"),
+                ("history", "Show search history"),
+            )
+        ],
     )
-    health_thread.start()
-
-    logger.info("Bot is polling...")
-    app.run_polling(drop_pending_updates=True)
+    LOGGER.info("Bot is running with %d configured sites", sum(map(len, SITES.values())))
+    offset = 0
+    while True:
+        try:
+            updates = telegram(
+                "getUpdates", offset=offset, timeout=50, allowed_updates=["message"]
+            )
+            for update in updates or []:
+                offset = update["update_id"] + 1
+                handle_message(update.get("message", {}))
+        except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
+            LOGGER.warning("Polling failed: %s; retrying", exc)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        import traceback
-        print("❌ Startup error:")
-        traceback.print_exc()
-        raise
+    main()
