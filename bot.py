@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,7 +43,107 @@ def load_env() -> None:
 
 load_env()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+
+
+def supabase_enabled() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def supabase_request(
+    table: str,
+    method: str = "GET",
+    query: dict[str, str] | None = None,
+    payload: object | None = None,
+) -> list[dict]:
+    if not supabase_enabled():
+        raise RuntimeError("Supabase is not configured")
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if query:
+        url += "?" + urlencode(query)
+    request = Request(
+        url,
+        data=None if payload is None else json.dumps(payload).encode(),
+        method=method,
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Prefer": "return=representation,resolution=merge-duplicates",
+        },
+    )
+    with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        result = json.loads(response.read().decode() or "[]")
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected Supabase response")
+    return result
+
+
+def remote_cache_get(key: str) -> list[tuple[str, str]] | None:
+    rows = supabase_request(
+        "bot_cache",
+        query={"query": f"eq.{key}", "select": "response,created_at", "limit": "1"},
+    )
+    if not rows or int(time.time()) - int(rows[0]["created_at"]) >= CACHE_TTL:
+        return None
+    return [tuple(item) for item in rows[0]["response"]]
+
+
+def remote_cache_put(key: str, results: list[tuple[str, str]]) -> None:
+    supabase_request(
+        "bot_cache",
+        method="POST",
+        payload={"query": key, "response": results, "created_at": int(time.time())},
+    )
+
+
+def remote_add_history(chat_id: int, title: str, category: str) -> None:
+    supabase_request(
+        "bot_history",
+        method="POST",
+        payload={
+            "chat_id": chat_id,
+            "title": title,
+            "category": category,
+            "created_at": int(time.time()),
+        },
+    )
+
+
+def remote_save_favorite(chat_id: int, title: str, url: str) -> None:
+    supabase_request(
+        "bot_favorites",
+        method="POST",
+        payload={"chat_id": chat_id, "title": title, "url": url, "created_at": int(time.time())},
+    )
+
+
+def remote_list_favorites(chat_id: int) -> list[tuple[str, str]]:
+    rows = supabase_request(
+        "bot_favorites",
+        query={
+            "chat_id": f"eq.{chat_id}",
+            "select": "title,url",
+            "order": "created_at.desc",
+            "limit": "20",
+        },
+    )
+    return [(row["title"], row["url"]) for row in rows]
+
+
+def remote_list_history(chat_id: int) -> list[tuple[str, str]]:
+    rows = supabase_request(
+        "bot_history",
+        query={
+            "chat_id": f"eq.{chat_id}",
+            "select": "title,category",
+            "order": "created_at.desc",
+            "limit": "20",
+        },
+    )
+    return [(row["title"], row["category"]) for row in rows]
 
 
 def db() -> sqlite3.Connection:
@@ -88,6 +188,46 @@ def valid_site(value: object) -> bool:
 
 
 SITES = load_sites()
+
+
+def save_local_history(chat_id: int, title: str, category: str) -> None:
+    connection = db()
+    connection.execute(
+        "INSERT INTO history(chat_id, title, category, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, title, category, int(time.time())),
+    )
+    connection.commit()
+    connection.close()
+
+
+def save_local_favorite(chat_id: int, title: str, url: str) -> None:
+    connection = db()
+    connection.execute(
+        "INSERT OR IGNORE INTO favorites(chat_id, title, url, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, title, url, int(time.time())),
+    )
+    connection.commit()
+    connection.close()
+
+
+def local_list_favorites(chat_id: int) -> list[tuple[str, str]]:
+    connection = db()
+    rows = connection.execute(
+        "SELECT title, url FROM favorites WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
+        (chat_id,),
+    ).fetchall()
+    connection.close()
+    return rows
+
+
+def local_list_history(chat_id: int) -> list[tuple[str, str]]:
+    connection = db()
+    rows = connection.execute(
+        "SELECT title, category FROM history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
+        (chat_id,),
+    ).fetchall()
+    connection.close()
+    return rows
 
 
 class LinkParser(HTMLParser):
@@ -154,13 +294,25 @@ def search_site(site: str, title: str, category: str) -> list[tuple[str, str]]:
 
 def search(title: str, category: str) -> list[tuple[str, str]]:
     key = f"{category}:{title.lower().strip()}"
-    connection = db()
-    row = connection.execute(
-        "SELECT response, created_at FROM cache WHERE query = ?", (key,)
-    ).fetchone()
-    if row and int(time.time()) - row[1] < CACHE_TTL:
-        connection.close()
-        return [tuple(item) for item in json.loads(row[0])]
+    remote_failed = False
+    if supabase_enabled():
+        try:
+            cached = remote_cache_get(key)
+            if cached is not None:
+                return cached
+        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
+            LOGGER.warning("Supabase cache read failed; using local SQLite: %s", exc)
+            remote_failed = True
+
+    connection: sqlite3.Connection | None = None
+    if not supabase_enabled() or remote_failed:
+        connection = db()
+        row = connection.execute(
+            "SELECT response, created_at FROM cache WHERE query = ?", (key,)
+        ).fetchone()
+        if row and int(time.time()) - row[1] < CACHE_TTL:
+            connection.close()
+            return [tuple(item) for item in json.loads(row[0])]
 
     sites = SITES.get(category, [])[:MAX_SEARCH_SITES]
     results: list[tuple[str, str]] = []
@@ -171,13 +323,19 @@ def search(title: str, category: str) -> list[tuple[str, str]]:
             if len(results) >= MAX_RESULTS:
                 break
     results = results[:MAX_RESULTS]
+    if supabase_enabled():
+        try:
+            remote_cache_put(key, results)
+            return results
+        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
+            LOGGER.warning("Supabase cache write failed; using local SQLite: %s", exc)
+            if connection is None:
+                connection = db()
+    if connection is None:
+        connection = db()
     connection.execute(
         "INSERT OR REPLACE INTO cache(query, response, created_at) VALUES (?, ?, ?)",
         (key, json.dumps(results), int(time.time())),
-    )
-    connection.execute(
-        "INSERT INTO history(chat_id, title, category, created_at) VALUES (?, ?, ?, ?)",
-        (0, title, category, int(time.time())),
     )
     connection.commit()
     connection.close()
@@ -239,30 +397,41 @@ def handle_message(message: dict) -> None:
         if not title or not valid_site(url):
             send(chat_id, "Provide a title and a valid http(s) URL.")
             return
-        connection = db()
-        connection.execute(
-            "INSERT OR IGNORE INTO favorites(chat_id, title, url, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, title, url, int(time.time())),
-        )
-        connection.commit()
-        connection.close()
+        if supabase_enabled():
+            try:
+                remote_save_favorite(chat_id, title, url)
+            except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
+                LOGGER.warning("Supabase favorite save failed; using local SQLite: %s", exc)
+                save_local_favorite(chat_id, title, url)
+        else:
+            save_local_favorite(chat_id, title, url)
         send(chat_id, "Saved to favorites.")
         return
     if command in {"favorites", "history"}:
-        connection = db()
+        if supabase_enabled():
+            try:
+                rows = (
+                    remote_list_favorites(chat_id)
+                    if command == "favorites"
+                    else remote_list_history(chat_id)
+                )
+            except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
+                LOGGER.warning("Supabase %s read failed; using local SQLite: %s", command, exc)
+                rows = (
+                    local_list_favorites(chat_id)
+                    if command == "favorites"
+                    else local_list_history(chat_id)
+                )
+        else:
+            rows = (
+                local_list_favorites(chat_id)
+                if command == "favorites"
+                else local_list_history(chat_id)
+            )
         if command == "favorites":
-            rows = connection.execute(
-                "SELECT title, url FROM favorites WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
-                (chat_id,),
-            ).fetchall()
             reply = "\n".join(f"{escape(title)}\n{url}" for title, url in rows) or "No favorites yet."
         else:
-            rows = connection.execute(
-                "SELECT title, category FROM history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
-                (chat_id,),
-            ).fetchall()
             reply = "\n".join(f"{escape(category)}: {escape(title)}" for title, category in rows) or "No search history yet."
-        connection.close()
         send(chat_id, reply)
         return
     category = category_command(command) if command in {"movie", "tv", "anime", "game"} else "movie"
@@ -273,13 +442,14 @@ def handle_message(message: dict) -> None:
     send(chat_id, f"Searching for {title}...")
     try:
         results = search(title, category)
-        connection = db()
-        connection.execute(
-            "INSERT INTO history(chat_id, title, category, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, title, category, int(time.time())),
-        )
-        connection.commit()
-        connection.close()
+        if supabase_enabled():
+            try:
+                remote_add_history(chat_id, title, category)
+            except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
+                LOGGER.warning("Supabase history write failed; using local SQLite: %s", exc)
+                save_local_history(chat_id, title, category)
+        else:
+            save_local_history(chat_id, title, category)
         if results:
             send(chat_id, "\n\n".join(f"{escape(label)}\n{url}" for url, label in results))
         else:
@@ -319,7 +489,8 @@ def main() -> None:
     )
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing from .env or the environment")
-    db().close()
+    if not supabase_enabled():
+        db().close()
     threading.Thread(target=start_health_server, daemon=True, name="health").start()
     telegram(
         "setMyCommands",
