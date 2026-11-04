@@ -75,6 +75,10 @@ create table bot_favorites (
   created_at bigint not null,
   unique (chat_id, title, url)
 );
+create table bot_meta (
+  key text primary key,
+  value text not null
+);
 ```
 
 For a private bot, enable Row Level Security and add policies allowing the
@@ -122,6 +126,11 @@ The master chat is restricted to the configured Telegram chat ID
 delete failures, and fatal shutdowns are reported to that chat. A completely
 powered-off or killed Raspberry Pi cannot send a Telegram message by itself;
 use a systemd service with restart enabled if automatic recovery is required.
+
+Restricted commands are excluded from the normal Telegram command menu and are
+published only to the master chat. On the first successful startup, the bot
+sends the master a welcome message and status controls. Later restarts do not
+repeat the first-start greeting.
 
 ---
 

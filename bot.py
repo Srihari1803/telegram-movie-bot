@@ -48,8 +48,10 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 MASTER_CHAT_ID = 5589716681
 MASTER_DELETE_PASSWORD = os.getenv("MASTER_DELETE_PASSWORD", "New_Creation")
+FIRST_START_FILE = BASE_DIR / ".master_greeted"
 _last_alert: dict[str, float] = {}
 _alert_lock = threading.Lock()
+STARTED_AT = time.time()
 
 
 def supabase_enabled() -> bool:
@@ -169,6 +171,37 @@ def remote_list_history(chat_id: int) -> list[tuple[str, str]]:
     return [(row["title"], row["category"]) for row in rows]
 
 
+def first_start_needed() -> bool:
+    if supabase_enabled():
+        try:
+            return not bool(
+                supabase_request(
+                    "bot_meta",
+                    query={"key": "eq.first_start", "select": "value", "limit": "1"},
+                )
+            )
+        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
+            LOGGER.warning("Could not check remote first-start state: %s", exc)
+    return not FIRST_START_FILE.exists()
+
+
+def mark_first_start_complete() -> None:
+    if supabase_enabled():
+        try:
+            supabase_request(
+                "bot_meta",
+                method="POST",
+                payload={"key": "first_start", "value": "complete"},
+            )
+            return
+        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
+            LOGGER.warning("Could not save remote first-start state: %s", exc)
+    try:
+        FIRST_START_FILE.touch()
+    except OSError as exc:
+        LOGGER.warning("Could not save local first-start state: %s", exc)
+
+
 def remote_delete_all() -> None:
     remote_delete("all")
 
@@ -203,12 +236,38 @@ def delete_local(scope: str) -> None:
 def master_keyboard() -> dict:
     return {
         "keyboard": [
+            [{"text": "/masterstatus"}],
             [{"text": "/deletecache"}, {"text": "/deletestorage"}],
             [{"text": "/deleteall"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
+
+
+def public_commands() -> list[dict[str, str]]:
+    return [
+        {"command": command, "description": description}
+        for command, description in (
+            ("start", "Show help"),
+            ("movie", "Search for a movie"),
+            ("tv", "Search for a TV show"),
+            ("anime", "Search for anime"),
+            ("game", "Search for a game"),
+            ("sites", "Show configured sites"),
+            ("favorites", "Show favorites"),
+            ("history", "Show search history"),
+        )
+    ]
+
+
+def master_commands() -> list[dict[str, str]]:
+    return public_commands() + [
+        {"command": "masterstatus", "description": "Show bot status"},
+        {"command": "deletecache", "description": "Delete cache (password required)"},
+        {"command": "deletestorage", "description": "Delete storage (password required)"},
+        {"command": "deleteall", "description": "Delete everything (password required)"},
+    ]
 
 
 def db() -> sqlite3.Connection:
@@ -463,6 +522,20 @@ def handle_message(message: dict) -> None:
         counts = ", ".join(f"{key}: {len(value)}" for key, value in SITES.items())
         send(chat_id, f"Configured search sites: {counts or 'none'}")
         return
+    if command == "masterstatus":
+        if chat_id != MASTER_CHAT_ID:
+            return
+        backend = "Supabase (remote-first)" if supabase_enabled() else "local SQLite"
+        uptime = int(time.time() - STARTED_AT)
+        send(
+            chat_id,
+            f"Master status\nStorage: {backend}\n"
+            f"Configured sites: {sum(map(len, SITES.values()))}\n"
+            f"Uptime: {uptime}s\n"
+            "Restricted actions require the password every time.",
+            master_keyboard(),
+        )
+        return
     if command in {"deletecache", "deletestorage", "deleteall"}:
         if not hmac.compare_digest(argument.strip(), MASTER_DELETE_PASSWORD):
             send(chat_id, "Password required or invalid password.")
@@ -607,31 +680,24 @@ def main() -> None:
     if not supabase_enabled():
         db().close()
     threading.Thread(target=start_health_server, daemon=True, name="health").start()
+    telegram("setMyCommands", scope={"type": "default"}, commands=public_commands())
     telegram(
         "setMyCommands",
-        commands=[
-            {"command": command, "description": description}
-            for command, description in (
-                ("start", "Show help"),
-                ("movie", "Search for a movie"),
-                ("tv", "Search for a TV show"),
-                ("anime", "Search for anime"),
-                ("game", "Search for a game"),
-                ("sites", "Show configured sites"),
-                ("favorites", "Show favorites"),
-                ("history", "Show search history"),
-                ("deleteall", "Delete all stored data (master only)"),
-            )
-        ],
+        scope={"type": "chat", "chat_id": MASTER_CHAT_ID},
+        commands=master_commands(),
     )
-    try:
-        send(
-            MASTER_CHAT_ID,
-            "Bot started. Restricted controls require the password every time.",
-            master_keyboard(),
-        )
-    except (HTTPError, URLError, RuntimeError) as exc:
-        LOGGER.warning("Could not send startup message to master: %s", exc)
+    if first_start_needed():
+        try:
+            send(
+                MASTER_CHAT_ID,
+                "Welcome, Master. The bot is ready for its first use.\n"
+                "Use /masterstatus to view bot health. Restricted controls require "
+                "the password every time.",
+                master_keyboard(),
+            )
+            mark_first_start_complete()
+        except (HTTPError, URLError, RuntimeError) as exc:
+            LOGGER.warning("Could not send first-start greeting to master: %s", exc)
     LOGGER.info("Bot is running with %d configured sites", sum(map(len, SITES.values())))
     offset = 0
     while True:
