@@ -108,7 +108,14 @@ The bot also accepts a plain-text title and detects its category automatically.
 ### View and manage your sites
 
 Use `/sites`, `/favorites`, and `/history` to inspect configured sites and
-your saved data.
+your saved data. The master can use `/deleteall New_Creation` to delete all
+history, favorites, and caches from Supabase and local fallback storage.
+
+The master chat is restricted to the configured Telegram chat ID
+`5589716681`. Supabase failures, polling faults, unauthorized delete attempts,
+delete failures, and fatal shutdowns are reported to that chat. A completely
+powered-off or killed Raspberry Pi cannot send a Telegram message by itself;
+use a systemd service with restart enabled if automatic recovery is required.
 
 ---
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import hmac
 import json
 import logging
 import os
@@ -45,10 +46,32 @@ load_env()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+MASTER_CHAT_ID = 5589716681
+MASTER_DELETE_PASSWORD = os.getenv("MASTER_DELETE_PASSWORD", "New_Creation")
+_last_alert: dict[str, float] = {}
+_alert_lock = threading.Lock()
 
 
 def supabase_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def notify_master(subject: str, details: str) -> None:
+    """Send operational alerts to the configured master without crashing the bot."""
+    now = time.time()
+    with _alert_lock:
+        if now - _last_alert.get(subject, 0) < 300:
+            return
+        _last_alert[subject] = now
+    try:
+        telegram(
+            "sendMessage",
+            chat_id=MASTER_CHAT_ID,
+            text=f"Movie bot alert: {subject}\n{details}",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        LOGGER.error("Could not notify master about %s: %s", subject, exc)
 
 
 def supabase_request(
@@ -144,6 +167,24 @@ def remote_list_history(chat_id: int) -> list[tuple[str, str]]:
         },
     )
     return [(row["title"], row["category"]) for row in rows]
+
+
+def remote_delete_all() -> None:
+    for table, column in (
+        ("bot_cache", "query"),
+        ("bot_history", "id"),
+        ("bot_favorites", "id"),
+    ):
+        supabase_request(table, method="DELETE", query={column: "not.is.null"})
+
+
+def delete_local_all() -> None:
+    connection = db()
+    connection.execute("DELETE FROM cache")
+    connection.execute("DELETE FROM history")
+    connection.execute("DELETE FROM favorites")
+    connection.commit()
+    connection.close()
 
 
 def db() -> sqlite3.Connection:
@@ -302,6 +343,7 @@ def search(title: str, category: str) -> list[tuple[str, str]]:
                 return cached
         except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
             LOGGER.warning("Supabase cache read failed; using local SQLite: %s", exc)
+            notify_master("Supabase unavailable", f"Cache read failed; local fallback enabled.\n{exc}")
             remote_failed = True
 
     connection: sqlite3.Connection | None = None
@@ -329,6 +371,7 @@ def search(title: str, category: str) -> list[tuple[str, str]]:
             return results
         except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
             LOGGER.warning("Supabase cache write failed; using local SQLite: %s", exc)
+            notify_master("Supabase unavailable", f"Cache write failed; local fallback enabled.\n{exc}")
             if connection is None:
                 connection = db()
     if connection is None:
@@ -389,6 +432,32 @@ def handle_message(message: dict) -> None:
         counts = ", ".join(f"{key}: {len(value)}" for key, value in SITES.items())
         send(chat_id, f"Configured search sites: {counts or 'none'}")
         return
+    if command == "deleteall":
+        if chat_id != MASTER_CHAT_ID:
+            send(chat_id, "This command is restricted to the bot master.")
+            return
+        if not hmac.compare_digest(argument.strip(), MASTER_DELETE_PASSWORD):
+            send(chat_id, "Invalid password.")
+            notify_master("Unauthorized delete attempt", f"Chat ID: {chat_id}")
+            return
+        failures = []
+        try:
+            if supabase_enabled():
+                remote_delete_all()
+        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            LOGGER.exception("Remote delete-all operation failed")
+            failures.append(f"remote: {exc}")
+        try:
+            delete_local_all()
+        except sqlite3.Error as exc:
+            LOGGER.exception("Local delete-all operation failed")
+            failures.append(f"local: {exc}")
+        if failures:
+            notify_master("Delete-all failed", "\n".join(failures))
+            send(chat_id, "Deletion was incomplete. The master has been notified.")
+        else:
+            send(chat_id, "All history, favorites, and caches have been deleted.")
+        return
     if command == "favorite":
         if "|" not in argument:
             send(chat_id, "Usage: /favorite <title> | <url>")
@@ -402,6 +471,7 @@ def handle_message(message: dict) -> None:
                 remote_save_favorite(chat_id, title, url)
             except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
                 LOGGER.warning("Supabase favorite save failed; using local SQLite: %s", exc)
+                notify_master("Supabase unavailable", f"Favorite save failed; local fallback enabled.\n{exc}")
                 save_local_favorite(chat_id, title, url)
         else:
             save_local_favorite(chat_id, title, url)
@@ -417,6 +487,7 @@ def handle_message(message: dict) -> None:
                 )
             except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
                 LOGGER.warning("Supabase %s read failed; using local SQLite: %s", command, exc)
+                notify_master("Supabase unavailable", f"{command} read failed; local fallback enabled.\n{exc}")
                 rows = (
                     local_list_favorites(chat_id)
                     if command == "favorites"
@@ -447,6 +518,7 @@ def handle_message(message: dict) -> None:
                 remote_add_history(chat_id, title, category)
             except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
                 LOGGER.warning("Supabase history write failed; using local SQLite: %s", exc)
+                notify_master("Supabase unavailable", f"History write failed; local fallback enabled.\n{exc}")
                 save_local_history(chat_id, title, category)
         else:
             save_local_history(chat_id, title, category)
@@ -505,6 +577,7 @@ def main() -> None:
                 ("sites", "Show configured sites"),
                 ("favorites", "Show favorites"),
                 ("history", "Show search history"),
+                ("deleteall", "Delete all stored data (master only)"),
             )
         ],
     )
@@ -520,8 +593,14 @@ def main() -> None:
                 handle_message(update.get("message", {}))
         except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
             LOGGER.warning("Polling failed: %s; retrying", exc)
+            notify_master("Bot polling fault", str(exc))
             time.sleep(5)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        LOGGER.exception("Fatal bot error")
+        notify_master("Bot stopped", str(exc))
+        raise
