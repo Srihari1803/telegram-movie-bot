@@ -170,21 +170,45 @@ def remote_list_history(chat_id: int) -> list[tuple[str, str]]:
 
 
 def remote_delete_all() -> None:
-    for table, column in (
-        ("bot_cache", "query"),
-        ("bot_history", "id"),
-        ("bot_favorites", "id"),
-    ):
+    remote_delete("all")
+
+
+def remote_delete(scope: str) -> None:
+    tables = {
+        "cache": (("bot_cache", "query"),),
+        "storage": (("bot_history", "id"), ("bot_favorites", "id")),
+        "all": (
+            ("bot_cache", "query"),
+            ("bot_history", "id"),
+            ("bot_favorites", "id"),
+        ),
+    }
+    for table, column in tables[scope]:
         supabase_request(table, method="DELETE", query={column: "not.is.null"})
 
 
-def delete_local_all() -> None:
+def delete_local(scope: str) -> None:
     connection = db()
-    connection.execute("DELETE FROM cache")
-    connection.execute("DELETE FROM history")
-    connection.execute("DELETE FROM favorites")
+    tables = {
+        "cache": ("cache",),
+        "storage": ("history", "favorites"),
+        "all": ("cache", "history", "favorites"),
+    }
+    for table in tables[scope]:
+        connection.execute(f"DELETE FROM {table}")
     connection.commit()
     connection.close()
+
+
+def master_keyboard() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "/deletecache"}, {"text": "/deletestorage"}],
+            [{"text": "/deleteall"}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
 
 
 def db() -> sqlite3.Connection:
@@ -399,8 +423,15 @@ def telegram(method: str, **params: object) -> object:
     return payload.get("result")
 
 
-def send(chat_id: int, text: str) -> None:
-    telegram("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True)
+def send(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+    params: dict[str, object] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        params["reply_markup"] = reply_markup
+    telegram("sendMessage", **params)
 
 
 def escape(text: str) -> str:
@@ -422,41 +453,53 @@ def handle_message(message: dict) -> None:
     command, _, argument = text.partition(" ")
     command = command.lstrip("/").split("@", 1)[0].lower()
     if command in {"start", "help"}:
-        send(
-            chat_id,
+        text = (
             "Send a title or use /movie, /tv, /anime, or /game followed by a title.\n"
-            "Save a result with /favorite <title> | <url>.",
+            "Save a result with /favorite <title> | <url>."
         )
+        send(chat_id, text, master_keyboard() if chat_id == MASTER_CHAT_ID else None)
         return
     if command == "sites":
         counts = ", ".join(f"{key}: {len(value)}" for key, value in SITES.items())
         send(chat_id, f"Configured search sites: {counts or 'none'}")
         return
-    if command == "deleteall":
+    if command in {"deletecache", "deletestorage", "deleteall"}:
+        if not hmac.compare_digest(argument.strip(), MASTER_DELETE_PASSWORD):
+            send(chat_id, "Password required or invalid password.")
+            if chat_id != MASTER_CHAT_ID:
+                notify_master("Unauthorized delete attempt", f"Chat ID: {chat_id}")
+            return
         if chat_id != MASTER_CHAT_ID:
             send(chat_id, "This command is restricted to the bot master.")
-            return
-        if not hmac.compare_digest(argument.strip(), MASTER_DELETE_PASSWORD):
-            send(chat_id, "Invalid password.")
             notify_master("Unauthorized delete attempt", f"Chat ID: {chat_id}")
             return
+        scope = {
+            "deletecache": "cache",
+            "deletestorage": "storage",
+            "deleteall": "all",
+        }[command]
         failures = []
         try:
             if supabase_enabled():
-                remote_delete_all()
+                remote_delete(scope)
         except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError, sqlite3.Error) as exc:
             LOGGER.exception("Remote delete-all operation failed")
             failures.append(f"remote: {exc}")
         try:
-            delete_local_all()
+            delete_local(scope)
         except sqlite3.Error as exc:
             LOGGER.exception("Local delete-all operation failed")
             failures.append(f"local: {exc}")
         if failures:
-            notify_master("Delete-all failed", "\n".join(failures))
+            notify_master(f"Delete {scope} failed", "\n".join(failures))
             send(chat_id, "Deletion was incomplete. The master has been notified.")
         else:
-            send(chat_id, "All history, favorites, and caches have been deleted.")
+            labels = {
+                "cache": "cache",
+                "storage": "history and favorites",
+                "all": "history, favorites, and caches",
+            }
+            send(chat_id, f"Deleted {labels[scope]}.")
         return
     if command == "favorite":
         if "|" not in argument:
@@ -581,6 +624,14 @@ def main() -> None:
             )
         ],
     )
+    try:
+        send(
+            MASTER_CHAT_ID,
+            "Bot started. Restricted controls require the password every time.",
+            master_keyboard(),
+        )
+    except (HTTPError, URLError, RuntimeError) as exc:
+        LOGGER.warning("Could not send startup message to master: %s", exc)
     LOGGER.info("Bot is running with %d configured sites", sum(map(len, SITES.values())))
     offset = 0
     while True:

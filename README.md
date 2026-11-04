@@ -108,8 +108,14 @@ The bot also accepts a plain-text title and detects its category automatically.
 ### View and manage your sites
 
 Use `/sites`, `/favorites`, and `/history` to inspect configured sites and
-your saved data. The master can use `/deleteall New_Creation` to delete all
-history, favorites, and caches from Supabase and local fallback storage.
+your saved data. Only the master chat sees the delete buttons. The master can
+use `/deletecache New_Creation`, `/deletestorage New_Creation`, or
+`/deleteall New_Creation` to delete cached searches, saved history/favorites,
+or everything from Supabase and local fallback storage.
+
+The password is required on every restricted command, including after a bot
+restart or Raspberry Pi power cycle. No password session is saved. Other users
+cannot perform restricted operations even if they know the password.
 
 The master chat is restricted to the configured Telegram chat ID
 `5589716681`. Supabase failures, polling faults, unauthorized delete attempts,
