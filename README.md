@@ -113,9 +113,11 @@ The bot also accepts a plain-text title and detects its category automatically.
 
 Use `/sites`, `/favorites`, and `/history` to inspect configured sites and
 your saved data. Only the master chat sees the delete buttons. The master can
-use `/deletecache New_Creation`, `/deletestorage New_Creation`, or
-`/deleteall New_Creation` to delete cached searches, saved history/favorites,
-or everything from Supabase and local fallback storage.
+send `/deletecache`, `/deletestorage`, or `/deleteall`; the bot then asks for
+the password in the next message. The one-message form
+(`/deletecache New_Creation`) is also supported. These commands delete cached
+searches, saved history/favorites, or everything from Supabase and local
+fallback storage.
 
 The password is required on every restricted command, including after a bot
 restart or Raspberry Pi power cycle. No password session is saved. Other users
@@ -136,10 +138,12 @@ repeat the first-start greeting.
 
 ## How the search works
 
-For each configured site, the bot makes a bounded DuckDuckGo HTML search and
-only accepts result links whose hostname exactly matches the configured hostname.
-At most eight sites are queried with four workers, which keeps memory and CPU
-usage reasonable on a Raspberry Pi.
+For each configured site, the bot makes bounded DuckDuckGo HTML and Lite
+searches and only accepts result links whose hostname matches the configured
+hostname. It checks up to three batches of twelve sites with four workers per
+batch, stopping as soon as enough results are found. This improves coverage
+when the first configured sites do not contain a title while keeping memory
+and CPU usage reasonable on a Raspberry Pi.
 
 ---
 

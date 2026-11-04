@@ -25,8 +25,10 @@ LOGGER = logging.getLogger("movie-bot")
 TELEGRAM_API = "https://api.telegram.org/bot{}/{}"
 REQUEST_TIMEOUT = 12
 CACHE_TTL = 3600
-MAX_SEARCH_SITES = 8
+MAX_SEARCH_SITES = 12
+MAX_SEARCH_BATCHES = 3
 MAX_RESULTS = 5
+PASSWORD_PROMPT_TTL = 120
 
 
 def load_env() -> None:
@@ -52,6 +54,7 @@ FIRST_START_FILE = BASE_DIR / ".master_greeted"
 _last_alert: dict[str, float] = {}
 _alert_lock = threading.Lock()
 STARTED_AT = time.time()
+_pending_passwords: dict[int, tuple[str, float]] = {}
 
 
 def supabase_enabled() -> bool:
@@ -381,7 +384,10 @@ def fetch(url: str) -> str:
     request = Request(
         url,
         headers={
-            "User-Agent": "telegram-movie-bot/1.0 (+Raspberry Pi)",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux armv7l) "
+                "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            ),
             "Accept": "text/html,application/xhtml+xml",
         },
     )
@@ -391,23 +397,34 @@ def fetch(url: str) -> str:
 
 def search_site(site: str, title: str, category: str) -> list[tuple[str, str]]:
     parsed = urlparse(site)
-    domain = parsed.netloc.lower().split(":")[0]
-    search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'site:{domain} {title}')}"
-    try:
-        parser = LinkParser()
-        parser.feed(fetch(search_url))
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        LOGGER.debug("Search failed for %s: %s", domain, exc)
-        return []
+    domain = parsed.netloc.lower().split(":")[0].rstrip(".")
+    if domain.startswith("www."):
+        domain = domain[4:]
+    query = quote_plus(f'site:{domain} "{title}"')
+    search_urls = (
+        f"https://html.duckduckgo.com/html/?q={query}",
+        f"https://lite.duckduckgo.com/lite/?q={query}",
+    )
+    parser = LinkParser()
+    for search_url in search_urls:
+        try:
+            parser = LinkParser()
+            parser.feed(fetch(search_url))
+            if parser.links:
+                break
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            LOGGER.debug("Search failed for %s via %s: %s", domain, search_url, exc)
     results = []
     for href, text in parser.links:
         absolute = urljoin(search_url, href)
         parsed_result = urlparse(absolute)
-        if parsed_result.netloc.lower().endswith("duckduckgo.com"):
+        if parsed_result.netloc.lower().split(":")[0].endswith("duckduckgo.com"):
             redirected = parse_qs(parsed_result.query).get("uddg", [])
             if redirected:
                 absolute = redirected[0]
-        result_domain = urlparse(absolute).netloc.lower().split(":")[0]
+        result_domain = urlparse(absolute).netloc.lower().split(":")[0].rstrip(".")
+        if result_domain.startswith("www."):
+            result_domain = result_domain[4:]
         if result_domain != domain or not absolute.startswith(("http://", "https://")):
             continue
         label = text or title
@@ -439,14 +456,20 @@ def search(title: str, category: str) -> list[tuple[str, str]]:
             connection.close()
             return [tuple(item) for item in json.loads(row[0])]
 
-    sites = SITES.get(category, [])[:MAX_SEARCH_SITES]
+    sites = SITES.get(category, [])
     results: list[tuple[str, str]] = []
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(sites)))) as pool:
-        futures = [pool.submit(search_site, site, title, category) for site in sites]
-        for future in as_completed(futures):
-            results.extend(future.result())
-            if len(results) >= MAX_RESULTS:
-                break
+    for batch_start in range(0, len(sites), MAX_SEARCH_SITES):
+        if batch_start // MAX_SEARCH_SITES >= MAX_SEARCH_BATCHES:
+            break
+        batch = sites[batch_start : batch_start + MAX_SEARCH_SITES]
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(batch)))) as pool:
+            futures = [pool.submit(search_site, site, title, category) for site in batch]
+            for future in as_completed(futures):
+                results.extend(future.result())
+                if len(results) >= MAX_RESULTS:
+                    break
+        if len(results) >= MAX_RESULTS:
+            break
     results = results[:MAX_RESULTS]
     if supabase_enabled():
         try:
@@ -503,6 +526,36 @@ def category_command(command: str) -> str:
     )
 
 
+def delete_for_master(chat_id: int, command: str) -> None:
+    scope = {
+        "deletecache": "cache",
+        "deletestorage": "storage",
+        "deleteall": "all",
+    }[command]
+    failures = []
+    try:
+        if supabase_enabled():
+            remote_delete(scope)
+    except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        LOGGER.exception("Remote delete operation failed")
+        failures.append(f"remote: {exc}")
+    try:
+        delete_local(scope)
+    except sqlite3.Error as exc:
+        LOGGER.exception("Local delete operation failed")
+        failures.append(f"local: {exc}")
+    if failures:
+        notify_master(f"Delete {scope} failed", "\n".join(failures))
+        send(chat_id, "Deletion was incomplete. The master has been notified.")
+        return
+    labels = {
+        "cache": "cache",
+        "storage": "history and favorites",
+        "all": "history, favorites, and caches",
+    }
+    send(chat_id, f"Deleted {labels[scope]}.")
+
+
 def handle_message(message: dict) -> None:
     chat = message.get("chat", {})
     chat_id = chat.get("id")
@@ -511,6 +564,20 @@ def handle_message(message: dict) -> None:
         return
     command, _, argument = text.partition(" ")
     command = command.lstrip("/").split("@", 1)[0].lower()
+    pending = _pending_passwords.get(chat_id)
+    if pending:
+        pending_command, created_at = pending
+        if time.time() - created_at >= PASSWORD_PROMPT_TTL:
+            _pending_passwords.pop(chat_id, None)
+            send(chat_id, "Password prompt expired. Please start the delete command again.")
+            return
+        if command not in {"deletecache", "deletestorage", "deleteall"}:
+            _pending_passwords.pop(chat_id, None)
+            if hmac.compare_digest(text, MASTER_DELETE_PASSWORD):
+                delete_for_master(chat_id, pending_command)
+            else:
+                send(chat_id, "Password required or invalid password.")
+            return
     if command in {"start", "help"}:
         text = (
             "Send a title or use /movie, /tv, /anime, or /game followed by a title.\n"
@@ -537,42 +604,20 @@ def handle_message(message: dict) -> None:
         )
         return
     if command in {"deletecache", "deletestorage", "deleteall"}:
-        if not hmac.compare_digest(argument.strip(), MASTER_DELETE_PASSWORD):
-            send(chat_id, "Password required or invalid password.")
-            if chat_id != MASTER_CHAT_ID:
-                notify_master("Unauthorized delete attempt", f"Chat ID: {chat_id}")
-            return
         if chat_id != MASTER_CHAT_ID:
             send(chat_id, "This command is restricted to the bot master.")
             notify_master("Unauthorized delete attempt", f"Chat ID: {chat_id}")
             return
-        scope = {
-            "deletecache": "cache",
-            "deletestorage": "storage",
-            "deleteall": "all",
-        }[command]
-        failures = []
-        try:
-            if supabase_enabled():
-                remote_delete(scope)
-        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError, sqlite3.Error) as exc:
-            LOGGER.exception("Remote delete-all operation failed")
-            failures.append(f"remote: {exc}")
-        try:
-            delete_local(scope)
-        except sqlite3.Error as exc:
-            LOGGER.exception("Local delete-all operation failed")
-            failures.append(f"local: {exc}")
-        if failures:
-            notify_master(f"Delete {scope} failed", "\n".join(failures))
-            send(chat_id, "Deletion was incomplete. The master has been notified.")
-        else:
-            labels = {
-                "cache": "cache",
-                "storage": "history and favorites",
-                "all": "history, favorites, and caches",
-            }
-            send(chat_id, f"Deleted {labels[scope]}.")
+        password = argument.strip()
+        if not password:
+            _pending_passwords[chat_id] = (command, time.time())
+            send(chat_id, "Send the password in your next message.")
+            return
+        _pending_passwords.pop(chat_id, None)
+        if not hmac.compare_digest(password, MASTER_DELETE_PASSWORD):
+            send(chat_id, "Password required or invalid password.")
+            return
+        delete_for_master(chat_id, command)
         return
     if command == "favorite":
         if "|" not in argument:
