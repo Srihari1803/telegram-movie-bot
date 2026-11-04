@@ -116,10 +116,13 @@ def remote_cache_get(key: str) -> list[tuple[str, str]] | None:
     )
     if not rows or int(time.time()) - int(rows[0]["created_at"]) >= CACHE_TTL:
         return None
-    return [tuple(item) for item in rows[0]["response"]]
+    cached = [tuple(item) for item in rows[0]["response"]]
+    return cached or None
 
 
 def remote_cache_put(key: str, results: list[tuple[str, str]]) -> None:
+    if not results:
+        return
     supabase_request(
         "bot_cache",
         method="POST",
@@ -453,8 +456,10 @@ def search(title: str, category: str) -> list[tuple[str, str]]:
             "SELECT response, created_at FROM cache WHERE query = ?", (key,)
         ).fetchone()
         if row and int(time.time()) - row[1] < CACHE_TTL:
-            connection.close()
-            return [tuple(item) for item in json.loads(row[0])]
+            cached = [tuple(item) for item in json.loads(row[0])]
+            if cached:
+                connection.close()
+                return cached
 
     sites = SITES.get(category, [])
     results: list[tuple[str, str]] = []
@@ -471,7 +476,7 @@ def search(title: str, category: str) -> list[tuple[str, str]]:
         if len(results) >= MAX_RESULTS:
             break
     results = results[:MAX_RESULTS]
-    if supabase_enabled():
+    if supabase_enabled() and results:
         try:
             remote_cache_put(key, results)
             return results
@@ -482,11 +487,12 @@ def search(title: str, category: str) -> list[tuple[str, str]]:
                 connection = db()
     if connection is None:
         connection = db()
-    connection.execute(
-        "INSERT OR REPLACE INTO cache(query, response, created_at) VALUES (?, ?, ?)",
-        (key, json.dumps(results), int(time.time())),
-    )
-    connection.commit()
+    if results:
+        connection.execute(
+            "INSERT OR REPLACE INTO cache(query, response, created_at) VALUES (?, ?, ?)",
+            (key, json.dumps(results), int(time.time())),
+        )
+        connection.commit()
     connection.close()
     return results
 
