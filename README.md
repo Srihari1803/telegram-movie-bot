@@ -49,8 +49,10 @@ BOT_TOKEN=your-telegram-bot-token
 ```
 
 Set `SUPABASE_URL` and `SUPABASE_KEY` to store history, favorites, and cache
-remotely instead of on the Pi SD card. If Supabase is unavailable, the bot
-temporarily falls back to local `bot.db`.
+remotely instead of on the Pi SD card. Supabase is a database/storage service;
+it does not run the Telegram bot or provide the Pi's RAM. The Raspberry Pi
+only runs this small standard-library Python process. If Supabase is
+unavailable, the bot temporarily falls back to local `bot.db`.
 
 Run this SQL once in the Supabase SQL editor:
 
@@ -92,7 +94,9 @@ python bot.py
 ```
 
 The bot starts polling Telegram. With Supabase configured, normal data is stored
-remotely and `bot.db` is only used if the remote service fails.
+remotely and `bot.db` is only used if the remote service fails. Removing
+Supabase is optional, but would make the bot depend on local SD-card storage
+for history, favorites, and cache.
 
 ---
 
