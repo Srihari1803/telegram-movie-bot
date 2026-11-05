@@ -47,6 +47,8 @@ def load_env() -> None:
 load_env()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+if SUPABASE_URL.endswith("/rest/v1"):
+    SUPABASE_URL = SUPABASE_URL[:-8].rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 MASTER_CHAT_ID = 5589716681
 MASTER_DELETE_PASSWORD = os.getenv("MASTER_DELETE_PASSWORD", "New_Creation")
@@ -96,14 +98,23 @@ def supabase_request(
         method=method,
         headers={
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Authorization": "Bearer " + SUPABASE_KEY,
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Prefer": "return=representation,resolution=merge-duplicates",
         },
     )
-    with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-        result = json.loads(response.read().decode() or "[]")
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            result = json.loads(response.read().decode() or "[]")
+    except HTTPError as exc:
+        raise HTTPError(
+            exc.url,
+            exc.code,
+            f"Supabase {method} {table} failed with HTTP {exc.code}",
+            exc.headers,
+            exc.fp,
+        ) from exc
     if not isinstance(result, list):
         raise RuntimeError("Unexpected Supabase response")
     return result
@@ -503,7 +514,7 @@ def telegram(method: str, **params: object) -> object:
         data=json.dumps(params).encode(),
         headers={"Content-Type": "application/json"},
     )
-    api_timeout = max(REQUEST_TIMEOUT + 10, int(params.get("timeout", 0)) + 10)
+    api_timeout = max(REQUEST_TIMEOUT + 20, int(params.get("timeout", 0)) + 20)
     with urlopen(request, timeout=api_timeout) as response:
         payload = json.loads(response.read().decode())
     if not payload.get("ok"):
@@ -754,7 +765,7 @@ def main() -> None:
     while True:
         try:
             updates = telegram(
-                "getUpdates", offset=offset, timeout=50, allowed_updates=["message"]
+                "getUpdates", offset=offset, timeout=45, allowed_updates=["message"]
             )
             for update in updates or []:
                 offset = update["update_id"] + 1
