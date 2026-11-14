@@ -23,6 +23,7 @@ DB_FILE = BASE_DIR / "bot.db"
 SITES_FILE = BASE_DIR / "sites.json"
 LOGGER = logging.getLogger("movie-bot")
 TELEGRAM_API = "https://api.telegram.org/bot{}/{}"
+
 REQUEST_TIMEOUT = 12
 CACHE_TTL = 3600
 MAX_SEARCH_SITES = 12
@@ -34,25 +35,37 @@ PASSWORD_PROMPT_TTL = 120
 def load_env() -> None:
     """Load a local .env without requiring python-dotenv."""
     env_file = BASE_DIR / ".env"
+
     if not env_file.is_file():
         return
+
     for line in env_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()
+
         if not line or line.startswith("#") or "=" not in line:
             continue
+
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
 load_env()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+
 if SUPABASE_URL.endswith("/rest/v1"):
     SUPABASE_URL = SUPABASE_URL[:-8].rstrip("/")
+
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 MASTER_CHAT_ID = 5589716681
-MASTER_DELETE_PASSWORD = os.getenv("MASTER_DELETE_PASSWORD", "New_Creation")
+MASTER_DELETE_PASSWORD = os.getenv(
+    "MASTER_DELETE_PASSWORD",
+    "New_Creation",
+)
+
 FIRST_START_FILE = BASE_DIR / ".master_greeted"
+
 _last_alert: dict[str, float] = {}
 _alert_lock = threading.Lock()
 STARTED_AT = time.time()
@@ -64,12 +77,15 @@ def supabase_enabled() -> bool:
 
 
 def notify_master(subject: str, details: str) -> None:
-    """Send operational alerts to the configured master without crashing the bot."""
+    """Send operational alerts to the configured master without crashing."""
     now = time.time()
+
     with _alert_lock:
         if now - _last_alert.get(subject, 0) < 300:
             return
+
         _last_alert[subject] = now
+
     try:
         telegram(
             "sendMessage",
@@ -78,7 +94,11 @@ def notify_master(subject: str, details: str) -> None:
             disable_web_page_preview=True,
         )
     except Exception as exc:
-        LOGGER.error("Could not notify master about %s: %s", subject, exc)
+        LOGGER.error(
+            "Could not notify master about %s: %s",
+            subject,
+            exc,
+        )
 
 
 def supabase_request(
@@ -89,9 +109,12 @@ def supabase_request(
 ) -> list[dict]:
     if not supabase_enabled():
         raise RuntimeError("Supabase is not configured")
+
     url = f"{SUPABASE_URL}/rest/v1/{table}"
+
     if query:
         url += "?" + urlencode(query)
+
     request = Request(
         url,
         data=None if payload is None else json.dumps(payload).encode(),
@@ -104,6 +127,7 @@ def supabase_request(
             "Prefer": "return=representation,resolution=merge-duplicates",
         },
     )
+
     try:
         with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             result = json.loads(response.read().decode() or "[]")
@@ -115,33 +139,56 @@ def supabase_request(
             exc.headers,
             exc.fp,
         ) from exc
+
     if not isinstance(result, list):
         raise RuntimeError("Unexpected Supabase response")
+
     return result
 
 
 def remote_cache_get(key: str) -> list[tuple[str, str]] | None:
     rows = supabase_request(
         "bot_cache",
-        query={"query": f"eq.{key}", "select": "response,created_at", "limit": "1"},
+        query={
+            "query": f"eq.{key}",
+            "select": "response,created_at",
+            "limit": "1",
+        },
     )
-    if not rows or int(time.time()) - int(rows[0]["created_at"]) >= CACHE_TTL:
+
+    if not rows:
         return None
+
+    if int(time.time()) - int(rows[0]["created_at"]) >= CACHE_TTL:
+        return None
+
     cached = [tuple(item) for item in rows[0]["response"]]
     return cached or None
 
 
-def remote_cache_put(key: str, results: list[tuple[str, str]]) -> None:
+def remote_cache_put(
+    key: str,
+    results: list[tuple[str, str]],
+) -> None:
     if not results:
         return
+
     supabase_request(
         "bot_cache",
         method="POST",
-        payload={"query": key, "response": results, "created_at": int(time.time())},
+        payload={
+            "query": key,
+            "response": results,
+            "created_at": int(time.time()),
+        },
     )
 
 
-def remote_add_history(chat_id: int, title: str, category: str) -> None:
+def remote_add_history(
+    chat_id: int,
+    title: str,
+    category: str,
+) -> None:
     supabase_request(
         "bot_history",
         method="POST",
@@ -154,15 +201,26 @@ def remote_add_history(chat_id: int, title: str, category: str) -> None:
     )
 
 
-def remote_save_favorite(chat_id: int, title: str, url: str) -> None:
+def remote_save_favorite(
+    chat_id: int,
+    title: str,
+    url: str,
+) -> None:
     supabase_request(
         "bot_favorites",
         method="POST",
-        payload={"chat_id": chat_id, "title": title, "url": url, "created_at": int(time.time())},
+        payload={
+            "chat_id": chat_id,
+            "title": title,
+            "url": url,
+            "created_at": int(time.time()),
+        },
     )
 
 
-def remote_list_favorites(chat_id: int) -> list[tuple[str, str]]:
+def remote_list_favorites(
+    chat_id: int,
+) -> list[tuple[str, str]]:
     rows = supabase_request(
         "bot_favorites",
         query={
@@ -172,10 +230,13 @@ def remote_list_favorites(chat_id: int) -> list[tuple[str, str]]:
             "limit": "20",
         },
     )
+
     return [(row["title"], row["url"]) for row in rows]
 
 
-def remote_list_history(chat_id: int) -> list[tuple[str, str]]:
+def remote_list_history(
+    chat_id: int,
+) -> list[tuple[str, str]]:
     rows = supabase_request(
         "bot_history",
         query={
@@ -185,6 +246,7 @@ def remote_list_history(chat_id: int) -> list[tuple[str, str]]:
             "limit": "20",
         },
     )
+
     return [(row["title"], row["category"]) for row in rows]
 
 
@@ -194,11 +256,26 @@ def first_start_needed() -> bool:
             return not bool(
                 supabase_request(
                     "bot_meta",
-                    query={"key": "eq.first_start", "select": "value", "limit": "1"},
+                    query={
+                        "key": "eq.first_start",
+                        "select": "value",
+                        "limit": "1",
+                    },
                 )
             )
-        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
-            LOGGER.warning("Could not check remote first-start state: %s", exc)
+        except (
+            HTTPError,
+            URLError,
+            OSError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            LOGGER.warning(
+                "Could not check remote first-start state: %s",
+                exc,
+            )
+
     return not FIRST_START_FILE.exists()
 
 
@@ -208,15 +285,32 @@ def mark_first_start_complete() -> None:
             supabase_request(
                 "bot_meta",
                 method="POST",
-                payload={"key": "first_start", "value": "complete"},
+                payload={
+                    "key": "first_start",
+                    "value": "complete",
+                },
             )
             return
-        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
-            LOGGER.warning("Could not save remote first-start state: %s", exc)
+        except (
+            HTTPError,
+            URLError,
+            OSError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            LOGGER.warning(
+                "Could not save remote first-start state: %s",
+                exc,
+            )
+
     try:
         FIRST_START_FILE.touch()
     except OSError as exc:
-        LOGGER.warning("Could not save local first-start state: %s", exc)
+        LOGGER.warning(
+            "Could not save local first-start state: %s",
+            exc,
+        )
 
 
 def remote_delete_all() -> None:
@@ -226,26 +320,62 @@ def remote_delete_all() -> None:
 def remote_delete(scope: str) -> None:
     tables = {
         "cache": (("bot_cache", "query"),),
-        "storage": (("bot_history", "id"), ("bot_favorites", "id")),
+        "storage": (
+            ("bot_history", "id"),
+            ("bot_favorites", "id"),
+        ),
         "all": (
             ("bot_cache", "query"),
             ("bot_history", "id"),
             ("bot_favorites", "id"),
         ),
     }
+
     for table, column in tables[scope]:
-        supabase_request(table, method="DELETE", query={column: "not.is.null"})
+        supabase_request(
+            table,
+            method="DELETE",
+            query={column: "not.is.null"},
+        )
+
+
+def db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_FILE, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS history "
+        "(chat_id INTEGER, title TEXT, category TEXT, created_at INTEGER)"
+    )
+
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS favorites "
+        "(chat_id INTEGER, title TEXT, url TEXT, created_at INTEGER, "
+        "PRIMARY KEY (chat_id, title, url))"
+    )
+
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS cache "
+        "(query TEXT PRIMARY KEY, response TEXT, created_at INTEGER)"
+    )
+
+    connection.commit()
+    return connection
 
 
 def delete_local(scope: str) -> None:
     connection = db()
+
     tables = {
         "cache": ("cache",),
         "storage": ("history", "favorites"),
         "all": ("cache", "history", "favorites"),
     }
+
     for table in tables[scope]:
         connection.execute(f"DELETE FROM {table}")
+
     connection.commit()
     connection.close()
 
@@ -254,7 +384,10 @@ def master_keyboard() -> dict:
     return {
         "keyboard": [
             [{"text": "/masterstatus"}],
-            [{"text": "/deletecache"}, {"text": "/deletestorage"}],
+            [
+                {"text": "/deletecache"},
+                {"text": "/deletestorage"},
+            ],
             [{"text": "/deleteall"}],
         ],
         "resize_keyboard": True,
@@ -280,93 +413,137 @@ def public_commands() -> list[dict[str, str]]:
 
 def master_commands() -> list[dict[str, str]]:
     return public_commands() + [
-        {"command": "masterstatus", "description": "Show bot status"},
-        {"command": "deletecache", "description": "Delete cache (password required)"},
-        {"command": "deletestorage", "description": "Delete storage (password required)"},
-        {"command": "deleteall", "description": "Delete everything (password required)"},
+        {
+            "command": "masterstatus",
+            "description": "Show bot status",
+        },
+        {
+            "command": "deletecache",
+            "description": "Delete cache (password required)",
+        },
+        {
+            "command": "deletestorage",
+            "description": "Delete storage (password required)",
+        },
+        {
+            "command": "deleteall",
+            "description": "Delete everything (password required)",
+        },
     ]
-
-
-def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_FILE, timeout=10)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS history "
-        "(chat_id INTEGER, title TEXT, category TEXT, created_at INTEGER)"
-    )
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS favorites "
-        "(chat_id INTEGER, title TEXT, url TEXT, created_at INTEGER, "
-        "PRIMARY KEY (chat_id, title, url))"
-    )
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS cache "
-        "(query TEXT PRIMARY KEY, response TEXT, created_at INTEGER)"
-    )
-    connection.commit()
-    return connection
 
 
 def load_sites() -> dict[str, list[str]]:
     try:
-        data = json.loads(SITES_FILE.read_text(encoding="utf-8"))
+        data = json.loads(
+            SITES_FILE.read_text(encoding="utf-8")
+        )
+
         return {
-            key: [url for url in urls if valid_site(url)]
+            key: [
+                url
+                for url in urls
+                if valid_site(url)
+            ]
             for key, urls in data.items()
             if isinstance(urls, list)
         }
     except (OSError, ValueError) as exc:
-        LOGGER.error("Could not read %s: %s", SITES_FILE, exc)
+        LOGGER.error(
+            "Could not read %s: %s",
+            SITES_FILE,
+            exc,
+        )
         return {}
 
 
 def valid_site(value: object) -> bool:
     if not isinstance(value, str):
         return False
+
     parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.netloc)
+    )
 
 
 SITES = load_sites()
 
 
-def save_local_history(chat_id: int, title: str, category: str) -> None:
+def save_local_history(
+    chat_id: int,
+    title: str,
+    category: str,
+) -> None:
     connection = db()
+
     connection.execute(
-        "INSERT INTO history(chat_id, title, category, created_at) VALUES (?, ?, ?, ?)",
-        (chat_id, title, category, int(time.time())),
+        "INSERT INTO history(chat_id, title, category, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            chat_id,
+            title,
+            category,
+            int(time.time()),
+        ),
     )
+
     connection.commit()
     connection.close()
 
 
-def save_local_favorite(chat_id: int, title: str, url: str) -> None:
+def save_local_favorite(
+    chat_id: int,
+    title: str,
+    url: str,
+) -> None:
     connection = db()
+
     connection.execute(
-        "INSERT OR IGNORE INTO favorites(chat_id, title, url, created_at) VALUES (?, ?, ?, ?)",
-        (chat_id, title, url, int(time.time())),
+        "INSERT OR IGNORE INTO favorites "
+        "(chat_id, title, url, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            chat_id,
+            title,
+            url,
+            int(time.time()),
+        ),
     )
+
     connection.commit()
     connection.close()
 
 
-def local_list_favorites(chat_id: int) -> list[tuple[str, str]]:
+def local_list_favorites(
+    chat_id: int,
+) -> list[tuple[str, str]]:
     connection = db()
+
     rows = connection.execute(
-        "SELECT title, url FROM favorites WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
+        "SELECT title, url FROM favorites "
+        "WHERE chat_id = ? "
+        "ORDER BY created_at DESC LIMIT 20",
         (chat_id,),
     ).fetchall()
+
     connection.close()
     return rows
 
 
-def local_list_history(chat_id: int) -> list[tuple[str, str]]:
+def local_list_history(
+    chat_id: int,
+) -> list[tuple[str, str]]:
     connection = db()
+
     rows = connection.execute(
-        "SELECT title, category FROM history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20",
+        "SELECT title, category FROM history "
+        "WHERE chat_id = ? "
+        "ORDER BY created_at DESC LIMIT 20",
         (chat_id,),
     ).fetchall()
+
     connection.close()
     return rows
 
@@ -378,7 +555,11 @@ class LinkParser(HTMLParser):
         self.current_href = ""
         self.current_text: list[str] = []
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
         if tag.lower() == "a":
             self.current_href = dict(attrs).get("href") or ""
             self.current_text = []
@@ -389,8 +570,14 @@ class LinkParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "a" and self.current_href:
-            text = " ".join("".join(self.current_text).split())
-            self.links.append((self.current_href, text))
+            text = " ".join(
+                "".join(self.current_text).split()
+            )
+
+            self.links.append(
+                (self.current_href, text)
+            )
+
             self.current_href = ""
 
 
@@ -400,261 +587,679 @@ def fetch(url: str) -> str:
         headers={
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux armv7l) "
-                "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                "AppleWebKit/537.36 "
+                "Chrome/120 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml",
+            "Accept": (
+                "text/html,application/xhtml+xml"
+            ),
         },
     )
-    with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-        return response.read(512_000).decode("utf-8", errors="replace")
+
+    with urlopen(
+        request,
+        timeout=REQUEST_TIMEOUT,
+    ) as response:
+        return response.read(
+            512_000
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
 
 
-def search_site(site: str, title: str, category: str) -> list[tuple[str, str]]:
-    parsed = urlparse(site)
+def normalise_domain(value: str) -> str:
+    parsed = urlparse(value)
     domain = parsed.netloc.lower().split(":")[0].rstrip(".")
+
     if domain.startswith("www."):
         domain = domain[4:]
-    query = quote_plus(f'site:{domain} "{title}"')
-    search_urls = (
-        f"https://html.duckduckgo.com/html/?q={query}",
-        f"https://lite.duckduckgo.com/lite/?q={query}",
-    )
-    parser = LinkParser()
-    for search_url in search_urls:
-        try:
-            parser = LinkParser()
-            parser.feed(fetch(search_url))
-            if parser.links:
-                break
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            LOGGER.debug("Search failed for %s via %s: %s", domain, search_url, exc)
-    results = []
-    for href, text in parser.links:
-        absolute = urljoin(search_url, href)
-        parsed_result = urlparse(absolute)
-        if parsed_result.netloc.lower().split(":")[0].endswith("duckduckgo.com"):
-            redirected = parse_qs(parsed_result.query).get("uddg", [])
-            if redirected:
-                absolute = redirected[0]
-        result_domain = urlparse(absolute).netloc.lower().split(":")[0].rstrip(".")
-        if result_domain.startswith("www."):
-            result_domain = result_domain[4:]
-        if result_domain != domain or not absolute.startswith(("http://", "https://")):
+
+    return domain
+
+
+def extract_redirected_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().split(":")[0]
+
+    if host.endswith("duckduckgo.com"):
+        redirected = parse_qs(
+            parsed.query
+        ).get("uddg", [])
+
+        if redirected:
+            return redirected[0]
+
+    if host.endswith("bing.com"):
+        redirected = parse_qs(
+            parsed.query
+        ).get("u", [])
+
+        if redirected:
+            return redirected[0]
+
+    return url
+
+
+def filter_site_results(
+    links: list[tuple[str, str]],
+    domain: str,
+    title: str,
+    base_url: str,
+) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
+
+    for href, text in links:
+        absolute = urljoin(base_url, href)
+        absolute = extract_redirected_url(absolute)
+
+        if not absolute.startswith(
+            ("http://", "https://")
+        ):
             continue
+
+        if normalise_domain(absolute) != domain:
+            continue
+
         label = text or title
-        if absolute not in {url for url, _ in results}:
-            results.append((absolute, label[:120]))
+
+        if absolute not in {
+            url
+            for url, _ in results
+        }:
+            results.append(
+                (absolute, label[:120])
+            )
+
     return results[:2]
 
 
-def search(title: str, category: str) -> list[tuple[str, str]]:
+def search_site(
+    site: str,
+    title: str,
+    category: str,
+) -> list[tuple[str, str]]:
+    del category
+
+    domain = normalise_domain(site)
+    query = quote_plus(
+        f'site:{domain} "{title}"'
+    )
+
+    search_urls = (
+        (
+            "https://html.duckduckgo.com/html/"
+            f"?q={query}"
+        ),
+        (
+            "https://lite.duckduckgo.com/lite/"
+            f"?q={query}"
+        ),
+        (
+            "https://www.bing.com/search"
+            f"?q={query}"
+        ),
+    )
+
+    for search_url in search_urls:
+        try:
+            parser = LinkParser()
+            html_text = fetch(search_url)
+            parser.feed(html_text)
+
+            results = filter_site_results(
+                parser.links,
+                domain,
+                title,
+                search_url,
+            )
+
+            # Do not stop merely because the provider returned links.
+            # Stop only when links actually belong to the requested site.
+            if results:
+                return results
+
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            ValueError,
+        ) as exc:
+            LOGGER.debug(
+                "Search failed for %s via %s: %s",
+                domain,
+                search_url,
+                exc,
+            )
+
+    return []
+
+
+def search(
+    title: str,
+    category: str,
+) -> list[tuple[str, str]]:
     key = f"{category}:{title.lower().strip()}"
     remote_failed = False
+
     if supabase_enabled():
         try:
             cached = remote_cache_get(key)
+
             if cached is not None:
                 return cached
-        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
-            LOGGER.warning("Supabase cache read failed; using local SQLite: %s", exc)
-            notify_master("Supabase unavailable", f"Cache read failed; local fallback enabled.\n{exc}")
+
+        except (
+            HTTPError,
+            URLError,
+            OSError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            LOGGER.warning(
+                "Supabase cache read failed; "
+                "using local SQLite: %s",
+                exc,
+            )
+
+            notify_master(
+                "Supabase unavailable",
+                "Cache read failed; local fallback enabled.\n"
+                f"{exc}",
+            )
+
             remote_failed = True
 
     connection: sqlite3.Connection | None = None
+
     if not supabase_enabled() or remote_failed:
         connection = db()
+
         row = connection.execute(
-            "SELECT response, created_at FROM cache WHERE query = ?", (key,)
+            "SELECT response, created_at FROM cache "
+            "WHERE query = ?",
+            (key,),
         ).fetchone()
+
         if row and int(time.time()) - row[1] < CACHE_TTL:
-            cached = [tuple(item) for item in json.loads(row[0])]
+            cached = [
+                tuple(item)
+                for item in json.loads(row[0])
+            ]
+
             if cached:
                 connection.close()
                 return cached
 
     sites = SITES.get(category, [])
     results: list[tuple[str, str]] = []
-    for batch_start in range(0, len(sites), MAX_SEARCH_SITES):
-        if batch_start // MAX_SEARCH_SITES >= MAX_SEARCH_BATCHES:
+
+    for batch_start in range(
+        0,
+        len(sites),
+        MAX_SEARCH_SITES,
+    ):
+        if (
+            batch_start // MAX_SEARCH_SITES
+            >= MAX_SEARCH_BATCHES
+        ):
             break
-        batch = sites[batch_start : batch_start + MAX_SEARCH_SITES]
-        with ThreadPoolExecutor(max_workers=min(4, max(1, len(batch)))) as pool:
-            futures = [pool.submit(search_site, site, title, category) for site in batch]
+
+        batch = sites[
+            batch_start:batch_start + MAX_SEARCH_SITES
+        ]
+
+        with ThreadPoolExecutor(
+            max_workers=min(
+                4,
+                max(1, len(batch)),
+            )
+        ) as pool:
+            futures = [
+                pool.submit(
+                    search_site,
+                    site,
+                    title,
+                    category,
+                )
+                for site in batch
+            ]
+
             for future in as_completed(futures):
-                results.extend(future.result())
+                try:
+                    results.extend(
+                        future.result()
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Search worker failed: %s",
+                        exc,
+                    )
+
                 if len(results) >= MAX_RESULTS:
                     break
+
         if len(results) >= MAX_RESULTS:
             break
+
     results = results[:MAX_RESULTS]
+
     if supabase_enabled() and results:
         try:
             remote_cache_put(key, results)
             return results
-        except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
-            LOGGER.warning("Supabase cache write failed; using local SQLite: %s", exc)
-            notify_master("Supabase unavailable", f"Cache write failed; local fallback enabled.\n{exc}")
+
+        except (
+            HTTPError,
+            URLError,
+            OSError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            LOGGER.warning(
+                "Supabase cache write failed; "
+                "using local SQLite: %s",
+                exc,
+            )
+
+            notify_master(
+                "Supabase unavailable",
+                "Cache write failed; local fallback enabled.\n"
+                f"{exc}",
+            )
+
             if connection is None:
                 connection = db()
+
     if connection is None:
         connection = db()
+
     if results:
         connection.execute(
-            "INSERT OR REPLACE INTO cache(query, response, created_at) VALUES (?, ?, ?)",
-            (key, json.dumps(results), int(time.time())),
+            "INSERT OR REPLACE INTO cache "
+            "(query, response, created_at) "
+            "VALUES (?, ?, ?)",
+            (
+                key,
+                json.dumps(results),
+                int(time.time()),
+            ),
         )
+
         connection.commit()
+
     connection.close()
     return results
 
 
-def telegram(method: str, **params: object) -> object:
+def telegram(
+    method: str,
+    **params: object,
+) -> object:
     request = Request(
-        TELEGRAM_API.format(BOT_TOKEN, method),
+        TELEGRAM_API.format(
+            BOT_TOKEN,
+            method,
+        ),
         data=json.dumps(params).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+        },
     )
-    api_timeout = max(REQUEST_TIMEOUT + 20, int(params.get("timeout", 0)) + 20)
-    with urlopen(request, timeout=api_timeout) as response:
-        payload = json.loads(response.read().decode())
+
+    api_timeout = max(
+        REQUEST_TIMEOUT + 20,
+        int(params.get("timeout", 0)) + 20,
+    )
+
+    with urlopen(
+        request,
+        timeout=api_timeout,
+    ) as response:
+        payload = json.loads(
+            response.read().decode()
+        )
+
     if not payload.get("ok"):
-        raise RuntimeError(payload.get("description", "Telegram API request failed"))
+        raise RuntimeError(
+            payload.get(
+                "description",
+                "Telegram API request failed",
+            )
+        )
+
     return payload.get("result")
 
 
-def send(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+def send(
+    chat_id: int,
+    text: str,
+    reply_markup: dict | None = None,
+) -> None:
     params: dict[str, object] = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True,
     }
+
     if reply_markup is not None:
         params["reply_markup"] = reply_markup
-    telegram("sendMessage", **params)
 
-
-def escape(text: str) -> str:
-    return html.escape(text, quote=False)
-
-
-def category_command(command: str) -> str:
-    return {"movie": "movie", "tv": "tv", "anime": "anime", "game": "game"}.get(
-        command, "movie"
+    telegram(
+        "sendMessage",
+        **params,
     )
 
 
-def delete_for_master(chat_id: int, command: str) -> None:
+def escape(text: str) -> str:
+    return html.escape(
+        text,
+        quote=False,
+    )
+
+
+def category_command(command: str) -> str:
+    return {
+        "movie": "movie",
+        "tv": "tv",
+        "anime": "anime",
+        "game": "game",
+    }.get(command, "movie")
+
+
+def delete_for_master(
+    chat_id: int,
+    command: str,
+) -> None:
     scope = {
         "deletecache": "cache",
         "deletestorage": "storage",
         "deleteall": "all",
     }[command]
+
     failures = []
+
     try:
         if supabase_enabled():
             remote_delete(scope)
-    except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError, sqlite3.Error) as exc:
-        LOGGER.exception("Remote delete operation failed")
+
+    except (
+        HTTPError,
+        URLError,
+        OSError,
+        KeyError,
+        ValueError,
+        RuntimeError,
+        sqlite3.Error,
+    ) as exc:
+        LOGGER.exception(
+            "Remote delete operation failed"
+        )
         failures.append(f"remote: {exc}")
+
     try:
         delete_local(scope)
+
     except sqlite3.Error as exc:
-        LOGGER.exception("Local delete operation failed")
+        LOGGER.exception(
+            "Local delete operation failed"
+        )
         failures.append(f"local: {exc}")
+
     if failures:
-        notify_master(f"Delete {scope} failed", "\n".join(failures))
-        send(chat_id, "Deletion was incomplete. The master has been notified.")
+        notify_master(
+            f"Delete {scope} failed",
+            "\n".join(failures),
+        )
+
+        send(
+            chat_id,
+            "Deletion was incomplete. "
+            "The master has been notified.",
+        )
         return
+
     labels = {
         "cache": "cache",
         "storage": "history and favorites",
         "all": "history, favorites, and caches",
     }
-    send(chat_id, f"Deleted {labels[scope]}.")
+
+    send(
+        chat_id,
+        f"Deleted {labels[scope]}.",
+    )
 
 
 def handle_message(message: dict) -> None:
     chat = message.get("chat", {})
     chat_id = chat.get("id")
     text = (message.get("text") or "").strip()
+
     if not isinstance(chat_id, int) or not text:
         return
+
     command, _, argument = text.partition(" ")
     command = command.lstrip("/").split("@", 1)[0].lower()
+
     pending = _pending_passwords.get(chat_id)
+
     if pending:
         pending_command, created_at = pending
+
         if time.time() - created_at >= PASSWORD_PROMPT_TTL:
             _pending_passwords.pop(chat_id, None)
-            send(chat_id, "Password prompt expired. Please start the delete command again.")
+
+            send(
+                chat_id,
+                "Password prompt expired. "
+                "Please start the delete command again.",
+            )
             return
-        if command not in {"deletecache", "deletestorage", "deleteall"}:
-            _pending_passwords.pop(chat_id, None)
-            if hmac.compare_digest(text, MASTER_DELETE_PASSWORD):
-                delete_for_master(chat_id, pending_command)
+
+        if command not in {
+            "deletecache",
+            "deletestorage",
+            "deleteall",
+        }:
+            _pending_passwords.pop(
+                chat_id,
+                None,
+            )
+
+            if hmac.compare_digest(
+                text,
+                MASTER_DELETE_PASSWORD,
+            ):
+                delete_for_master(
+                    chat_id,
+                    pending_command,
+                )
             else:
-                send(chat_id, "Password required or invalid password.")
+                send(
+                    chat_id,
+                    "Password required or invalid password.",
+                )
+
             return
+
     if command in {"start", "help"}:
         text = (
-            "Send a title or use /movie, /tv, /anime, or /game followed by a title.\n"
-            "Save a result with /favorite <title> | <url>."
+            "Send a title or use /movie, /tv, /anime, "
+            "or /game followed by a title.\n"
+            "Save a result with "
+            "/favorite <title> | <url>."
         )
-        send(chat_id, text, master_keyboard() if chat_id == MASTER_CHAT_ID else None)
+
+        send(
+            chat_id,
+            text,
+            (
+                master_keyboard()
+                if chat_id == MASTER_CHAT_ID
+                else None
+            ),
+        )
         return
+
     if command == "sites":
-        counts = ", ".join(f"{key}: {len(value)}" for key, value in SITES.items())
-        send(chat_id, f"Configured search sites: {counts or 'none'}")
+        counts = ", ".join(
+            f"{key}: {len(value)}"
+            for key, value in SITES.items()
+        )
+
+        send(
+            chat_id,
+            f"Configured search sites: {counts or 'none'}",
+        )
         return
+
     if command == "masterstatus":
         if chat_id != MASTER_CHAT_ID:
             return
-        backend = "Supabase (remote-first)" if supabase_enabled() else "local SQLite"
+
+        backend = (
+            "Supabase (remote-first)"
+            if supabase_enabled()
+            else "local SQLite"
+        )
+
         uptime = int(time.time() - STARTED_AT)
+
         send(
             chat_id,
-            f"Master status\nStorage: {backend}\n"
-            f"Configured sites: {sum(map(len, SITES.values()))}\n"
+            f"Master status\n"
+            f"Storage: {backend}\n"
+            f"Configured sites: "
+            f"{sum(map(len, SITES.values()))}\n"
             f"Uptime: {uptime}s\n"
-            "Restricted actions require the password every time.",
+            "Restricted actions require the password "
+            "every time.",
             master_keyboard(),
         )
         return
-    if command in {"deletecache", "deletestorage", "deleteall"}:
+
+    if command in {
+        "deletecache",
+        "deletestorage",
+        "deleteall",
+    }:
         if chat_id != MASTER_CHAT_ID:
-            send(chat_id, "This command is restricted to the bot master.")
-            notify_master("Unauthorized delete attempt", f"Chat ID: {chat_id}")
+            send(
+                chat_id,
+                "This command is restricted to the bot master.",
+            )
+
+            notify_master(
+                "Unauthorized delete attempt",
+                f"Chat ID: {chat_id}",
+            )
             return
+
         password = argument.strip()
+
         if not password:
-            _pending_passwords[chat_id] = (command, time.time())
-            send(chat_id, "Send the password in your next message.")
+            _pending_passwords[chat_id] = (
+                command,
+                time.time(),
+            )
+
+            send(
+                chat_id,
+                "Send the password in your next message.",
+            )
             return
-        _pending_passwords.pop(chat_id, None)
-        if not hmac.compare_digest(password, MASTER_DELETE_PASSWORD):
-            send(chat_id, "Password required or invalid password.")
+
+        _pending_passwords.pop(
+            chat_id,
+            None,
+        )
+
+        if not hmac.compare_digest(
+            password,
+            MASTER_DELETE_PASSWORD,
+        ):
+            send(
+                chat_id,
+                "Password required or invalid password.",
+            )
             return
-        delete_for_master(chat_id, command)
+
+        delete_for_master(
+            chat_id,
+            command,
+        )
         return
+
     if command == "favorite":
         if "|" not in argument:
-            send(chat_id, "Usage: /favorite <title> | <url>")
+            send(
+                chat_id,
+                "Usage: /favorite <title> | <url>",
+            )
             return
-        title, url = (part.strip() for part in argument.split("|", 1))
+
+        title, url = (
+            part.strip()
+            for part in argument.split("|", 1)
+        )
+
         if not title or not valid_site(url):
-            send(chat_id, "Provide a title and a valid http(s) URL.")
+            send(
+                chat_id,
+                "Provide a title and a valid http(s) URL.",
+            )
             return
+
         if supabase_enabled():
             try:
-                remote_save_favorite(chat_id, title, url)
-            except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
-                LOGGER.warning("Supabase favorite save failed; using local SQLite: %s", exc)
-                notify_master("Supabase unavailable", f"Favorite save failed; local fallback enabled.\n{exc}")
-                save_local_favorite(chat_id, title, url)
+                remote_save_favorite(
+                    chat_id,
+                    title,
+                    url,
+                )
+
+            except (
+                HTTPError,
+                URLError,
+                OSError,
+                KeyError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
+                LOGGER.warning(
+                    "Supabase favorite save failed; "
+                    "using local SQLite: %s",
+                    exc,
+                )
+
+                notify_master(
+                    "Supabase unavailable",
+                    "Favorite save failed; "
+                    "local fallback enabled.\n"
+                    f"{exc}",
+                )
+
+                save_local_favorite(
+                    chat_id,
+                    title,
+                    url,
+                )
         else:
-            save_local_favorite(chat_id, title, url)
-        send(chat_id, "Saved to favorites.")
+            save_local_favorite(
+                chat_id,
+                title,
+                url,
+            )
+
+        send(
+            chat_id,
+            "Saved to favorites.",
+        )
         return
+
     if command in {"favorites", "history"}:
         if supabase_enabled():
             try:
@@ -663,9 +1268,28 @@ def handle_message(message: dict) -> None:
                     if command == "favorites"
                     else remote_list_history(chat_id)
                 )
-            except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
-                LOGGER.warning("Supabase %s read failed; using local SQLite: %s", command, exc)
-                notify_master("Supabase unavailable", f"{command} read failed; local fallback enabled.\n{exc}")
+
+            except (
+                HTTPError,
+                URLError,
+                OSError,
+                KeyError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
+                LOGGER.warning(
+                    "Supabase %s read failed; "
+                    "using local SQLite: %s",
+                    command,
+                    exc,
+                )
+
+                notify_master(
+                    "Supabase unavailable",
+                    f"{command} read failed; "
+                    f"local fallback enabled.\n{exc}",
+                )
+
                 rows = (
                     local_list_favorites(chat_id)
                     if command == "favorites"
@@ -677,42 +1301,153 @@ def handle_message(message: dict) -> None:
                 if command == "favorites"
                 else local_list_history(chat_id)
             )
+
         if command == "favorites":
-            reply = "\n".join(f"{escape(title)}\n{url}" for title, url in rows) or "No favorites yet."
+            reply = (
+                "\n".join(
+                    f"{escape(title)}\n{url}"
+                    for title, url in rows
+                )
+                or "No favorites yet."
+            )
         else:
-            reply = "\n".join(f"{escape(category)}: {escape(title)}" for title, category in rows) or "No search history yet."
-        send(chat_id, reply)
+            reply = (
+                "\n".join(
+                    f"{escape(category)}: "
+                    f"{escape(title)}"
+                    for title, category in rows
+                )
+                or "No search history yet."
+            )
+
+        send(
+            chat_id,
+            reply,
+        )
         return
-    category = category_command(command) if command in {"movie", "tv", "anime", "game"} else "movie"
-    title = argument.strip() if command in {"movie", "tv", "anime", "game"} else text
+
+    category = (
+        category_command(command)
+        if command in {
+            "movie",
+            "tv",
+            "anime",
+            "game",
+        }
+        else "movie"
+    )
+
+    title = (
+        argument.strip()
+        if command in {
+            "movie",
+            "tv",
+            "anime",
+            "game",
+        }
+        else text
+    )
+
     if not title:
-        send(chat_id, f"Usage: /{category} <title>")
+        send(
+            chat_id,
+            f"Usage: /{category} <title>",
+        )
         return
-    send(chat_id, f"Searching for {title}...")
+
+    send(
+        chat_id,
+        f"Searching for {title}...",
+    )
+
     try:
-        results = search(title, category)
+        results = search(
+            title,
+            category,
+        )
+
         if supabase_enabled():
             try:
-                remote_add_history(chat_id, title, category)
-            except (HTTPError, URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
-                LOGGER.warning("Supabase history write failed; using local SQLite: %s", exc)
-                notify_master("Supabase unavailable", f"History write failed; local fallback enabled.\n{exc}")
-                save_local_history(chat_id, title, category)
+                remote_add_history(
+                    chat_id,
+                    title,
+                    category,
+                )
+
+            except (
+                HTTPError,
+                URLError,
+                OSError,
+                KeyError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
+                LOGGER.warning(
+                    "Supabase history write failed; "
+                    "using local SQLite: %s",
+                    exc,
+                )
+
+                notify_master(
+                    "Supabase unavailable",
+                    "History write failed; "
+                    "local fallback enabled.\n"
+                    f"{exc}",
+                )
+
+                save_local_history(
+                    chat_id,
+                    title,
+                    category,
+                )
         else:
-            save_local_history(chat_id, title, category)
+            save_local_history(
+                chat_id,
+                title,
+                category,
+            )
+
         if results:
-            send(chat_id, "\n\n".join(f"{escape(label)}\n{url}" for url, label in results))
+            send(
+                chat_id,
+                "\n\n".join(
+                    f"{escape(label)}\n{url}"
+                    for url, label in results
+                ),
+            )
         else:
-            send(chat_id, "No matching links found. Try a different title.")
-    except (HTTPError, URLError, RuntimeError, sqlite3.Error) as exc:
-        LOGGER.warning("Request failed for chat %s: %s", chat_id, exc)
-        send(chat_id, "The search service is temporarily unavailable. Please try again.")
+            send(
+                chat_id,
+                "No matching links found. "
+                "Try a different title.",
+            )
+
+    except (
+        HTTPError,
+        URLError,
+        RuntimeError,
+        sqlite3.Error,
+    ) as exc:
+        LOGGER.warning(
+            "Request failed for chat %s: %s",
+            chat_id,
+            exc,
+        )
+
+        send(
+            chat_id,
+            "The search service is temporarily "
+            "unavailable. Please try again.",
+        )
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        )
         self.end_headers()
         self.wfile.write(b"ok\n")
 
@@ -722,57 +1457,139 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server() -> None:
     try:
-        port = int(os.getenv("PORT", "8080"))
+        port = int(
+            os.getenv("PORT", "8080")
+        )
+
         if not 1 <= port <= 65535:
             raise ValueError
-        server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-        LOGGER.info("Health server listening on port %d", port)
+
+        server = ThreadingHTTPServer(
+            ("0.0.0.0", port),
+            HealthHandler,
+        )
+
+        LOGGER.info(
+            "Health server listening on port %d",
+            port,
+        )
+
         server.serve_forever()
+
     except (OSError, ValueError) as exc:
-        LOGGER.warning("Health server disabled: %s", exc)
+        LOGGER.warning(
+            "Health server disabled: %s",
+            exc,
+        )
 
 
 def main() -> None:
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s | %(levelname)s | %(message)s",
+        level=os.getenv(
+            "LOG_LEVEL",
+            "INFO",
+        ).upper(),
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
     )
+
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing from .env or the environment")
+        raise RuntimeError(
+            "BOT_TOKEN is missing from .env "
+            "or the environment"
+        )
+
     if not supabase_enabled():
         db().close()
-    threading.Thread(target=start_health_server, daemon=True, name="health").start()
-    telegram("setMyCommands", scope={"type": "default"}, commands=public_commands())
+
+    threading.Thread(
+        target=start_health_server,
+        daemon=True,
+        name="health",
+    ).start()
+
     telegram(
         "setMyCommands",
-        scope={"type": "chat", "chat_id": MASTER_CHAT_ID},
+        scope={"type": "default"},
+        commands=public_commands(),
+    )
+
+    telegram(
+        "setMyCommands",
+        scope={
+            "type": "chat",
+            "chat_id": MASTER_CHAT_ID,
+        },
         commands=master_commands(),
     )
+
     if first_start_needed():
         try:
             send(
                 MASTER_CHAT_ID,
-                "Welcome, Master. The bot is ready for its first use.\n"
-                "Use /masterstatus to view bot health. Restricted controls require "
-                "the password every time.",
+                "Welcome, Master. The bot is ready "
+                "for its first use.\n"
+                "Use /masterstatus to view bot health. "
+                "Restricted controls require the password "
+                "every time.",
                 master_keyboard(),
             )
+
             mark_first_start_complete()
-        except (HTTPError, URLError, RuntimeError) as exc:
-            LOGGER.warning("Could not send first-start greeting to master: %s", exc)
-    LOGGER.info("Bot is running with %d configured sites", sum(map(len, SITES.values())))
+
+        except (
+            HTTPError,
+            URLError,
+            RuntimeError,
+        ) as exc:
+            LOGGER.warning(
+                "Could not send first-start greeting "
+                "to master: %s",
+                exc,
+            )
+
+    LOGGER.info(
+        "Bot is running with %d configured sites",
+        sum(map(len, SITES.values())),
+    )
+
     offset = 0
+
     while True:
         try:
             updates = telegram(
-                "getUpdates", offset=offset, timeout=45, allowed_updates=["message"]
+                "getUpdates",
+                offset=offset,
+                timeout=45,
+                allowed_updates=["message"],
             )
+
             for update in updates or []:
                 offset = update["update_id"] + 1
-                handle_message(update.get("message", {}))
-        except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
-            LOGGER.warning("Polling failed: %s; retrying", exc)
-            notify_master("Bot polling fault", str(exc))
+                handle_message(
+                    update.get("message", {})
+                )
+
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            RuntimeError,
+            json.JSONDecodeError,
+        ) as exc:
+            LOGGER.warning(
+                "Polling failed: %s; retrying",
+                exc,
+            )
+
+            notify_master(
+                "Bot polling fault",
+                str(exc),
+            )
+
             time.sleep(5)
 
 
@@ -780,6 +1597,11 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        LOGGER.exception("Fatal bot error")
-        notify_master("Bot stopped", str(exc))
+        LOGGER.exception(
+            "Fatal bot error"
+        )
+        notify_master(
+            "Bot stopped",
+            str(exc),
+        )
         raise
