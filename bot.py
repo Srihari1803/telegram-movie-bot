@@ -1,1607 +1,1731 @@
-"""Small Telegram movie search bot with no third-party runtime dependencies."""
-
-from __future__ import annotations
-
-import html
-import hmac
+import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from html.parser import HTMLParser
-from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, urlencode, urljoin, urlparse
-from urllib.request import Request, urlopen
+from contextlib import contextmanager
+from typing import Any, Awaitable, Dict, Iterator, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_FILE = BASE_DIR / "bot.db"
-SITES_FILE = BASE_DIR / "sites.json"
-LOGGER = logging.getLogger("movie-bot")
-TELEGRAM_API = "https://api.telegram.org/bot{}/{}"
+import requests
+from requests.adapters import HTTPAdapter
+from dotenv import load_dotenv
+from ddgs import DDGS
+from supabase import create_client
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
+from telegram.error import BadRequest
 
-REQUEST_TIMEOUT = 12
-CACHE_TTL = 3600
-MAX_SEARCH_SITES = 12
-MAX_SEARCH_BATCHES = 3
-MAX_RESULTS = 5
-PASSWORD_PROMPT_TTL = 120
+# ─── Environment ────────────────────────────────────────────────────────────
+load_dotenv()
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-def load_env() -> None:
-    """Load a local .env without requiring python-dotenv."""
-    env_file = BASE_DIR / ".env"
-
-    if not env_file.is_file():
-        return
-
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
-
-
-load_env()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
-
-if SUPABASE_URL.endswith("/rest/v1"):
-    SUPABASE_URL = SUPABASE_URL[:-8].rstrip("/")
-
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-MASTER_CHAT_ID = 5589716681
-MASTER_DELETE_PASSWORD = os.getenv(
-    "MASTER_DELETE_PASSWORD",
-    "New_Creation",
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
 )
 
-FIRST_START_FILE = BASE_DIR / ".master_greeted"
+# ─── File paths ─────────────────────────────────────────────────────────────
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(_BASE_DIR, "bot.db")
+SITES_FILE = os.path.join(_BASE_DIR, "sites.json")
 
-_last_alert: dict[str, float] = {}
-_alert_lock = threading.Lock()
-STARTED_AT = time.time()
-_pending_passwords: dict[int, tuple[str, float]] = {}
+# ─── Tuning constants ────────────────────────────────────────────────────────
+DB_TIMEOUT = 30
+DB_BUSY_TIMEOUT_MS = 5000
+
+CACHE_DURATION = 86400          # 24 hours
+CACHE_CLEANUP_INTERVAL = 3600   # 1 hour
+
+# Sentinel for the fallback cleanup thread (used when JobQueue is unavailable)
+_cleanup_thread: Optional[threading.Thread] = None
+RESULTS_PER_PAGE = 5
+MAX_SEARCH_RESULTS = 8
+MAX_OVERVIEW_LENGTH = 400
+MAX_TITLE_LENGTH = 120
+TOKEN_CACHE_LIMIT = 25
+
+HTTP_TIMEOUT: Tuple[int, int] = (5, 15)   # (connect, read)
+HTTP_POOL_SIZE = 20
+
+CACHE_PREFIX_MOVIE = "movie"
+CACHE_PREFIX_OTT = "ott"
+CACHE_PREFIX_TMDB = "tmdb"
+CACHE_PREFIX_DETECT = "detect"
+CACHE_EMPTY_MARKER: Dict[str, bool] = {"_empty": True}
+
+SUPPORTED_TMDB_MEDIA_TYPES: Set[str] = {"movie", "tv"}
+MAX_TMDB_RATING = 10
+
+# ─── Categories ─────────────────────────────────────────────────────────────
+CATEGORY_MOVIE = "movie"
+CATEGORY_TV = "tv"
+CATEGORY_ANIME = "anime"
+CATEGORY_GAME = "game"
+
+CATEGORY_META: Dict[str, Dict[str, str]] = {
+    CATEGORY_MOVIE: {"label": "Movie", "icon": "🎬"},
+    CATEGORY_TV:    {"label": "TV",    "icon": "📺"},
+    CATEGORY_ANIME: {"label": "Anime", "icon": "🍿"},
+    CATEGORY_GAME:  {"label": "Game",  "icon": "🎮"},
+}
+
+SEARCH_CATEGORIES: List[str] = [
+    CATEGORY_MOVIE,
+    CATEGORY_TV,
+    CATEGORY_ANIME,
+    CATEGORY_GAME,
+]
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ─── HTTP session (shared, with connection pooling) ─────────────────────────
+_http_adapter = HTTPAdapter(
+    pool_connections=HTTP_POOL_SIZE,
+    pool_maxsize=HTTP_POOL_SIZE,
+)
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.mount("http://", _http_adapter)
+HTTP_SESSION.mount("https://", _http_adapter)
+HTTP_SESSION.headers.update({"User-Agent": "MovieSearchBot/1.0"})
+
+# ─── Static UI data ─────────────────────────────────────────────────────────
+BUTTON_NAMES: Dict[str, str] = {
+    "lookmovie2.to":        "🎬 LookMovie",
+    "goku-tv.pics":         "🍿 GokuTV",
+    "hurawatch.art":        "📺 HuraWatch",
+    "www8.123moviesfree.net": "🎥 123Movies",
+    "ww19.myasiantv.es":    "📺 MyAsianTV",
+    "desicinemas.to":       "🇮🇳 DesiCinema",
+    "uhdmovies.pink":       "💎 UHD Movies",
+    "moviesmod.farm":       "🎞 MoviesMod",
+}
+
+OTT_SITES: Dict[str, Dict[str, str]] = {
+    "DE": {
+        "Netflix Germany":      "https://www.netflix.com/de/",
+        "Disney+ Germany":      "https://www.disneyplus.com/de-de",
+        "Prime Video Germany":  "https://www.primevideo.com",
+    },
+    "US": {
+        "Netflix USA":  "https://www.netflix.com",
+        "Disney+ USA":  "https://www.disneyplus.com",
+        "Max USA":      "https://www.max.com",
+    },
+    "GB": {
+        "Netflix UK":   "https://www.netflix.com/gb/",
+        "Disney+ UK":   "https://www.disneyplus.com/en-gb",
+    },
+    "IN": {
+        "Netflix India":        "https://www.netflix.com/in/",
+        "Disney+ Hotstar":      "https://www.hotstar.com/in",
+        "Prime Video India":    "https://www.primevideo.com",
+    },
+}
+
+COUNTRY_INFO: Dict[str, Dict[str, str]] = {
+    "DE": {"flag": "🇩🇪", "name": "Germany"},
+    "US": {"flag": "🇺🇸", "name": "USA"},
+    "GB": {"flag": "🇬🇧", "name": "UK"},
+    "IN": {"flag": "🇮🇳", "name": "India"},
+}
+
+PROVIDER_ALIASES: Dict[str, Set[str]] = {
+    "primevideo": {"amazonprimevideo", "primevideo"},
+    "disneyplus": {"disneyplus", "disneyplushotstar", "hotstar"},
+    "max":        {"hbomax", "max"},
+}
 
 
-def supabase_enabled() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
+# ════════════════════════════════════════════════════════════════════════════
+# Database
+# ════════════════════════════════════════════════════════════════════════════
+
+def _configure_sqlite(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}")
 
 
-def notify_master(subject: str, details: str) -> None:
-    """Send operational alerts to the configured master without crashing."""
-    now = time.time()
-
-    with _alert_lock:
-        if now - _last_alert.get(subject, 0) < 300:
-            return
-
-        _last_alert[subject] = now
-
+@contextmanager
+def db_connection(commit: bool = False) -> Iterator[sqlite3.Connection]:
+    """
+    Yield a configured SQLite connection.
+    check_same_thread=False is safe here because each call creates its own
+    connection object used only within this context manager's scope.
+    """
+    conn = sqlite3.connect(DB_FILE, timeout=DB_TIMEOUT, check_same_thread=False)
+    _configure_sqlite(conn)
     try:
-        telegram(
-            "sendMessage",
-            chat_id=MASTER_CHAT_ID,
-            text=f"Movie bot alert: {subject}\n{details}",
-            disable_web_page_preview=True,
+        yield conn
+        if commit:
+            conn.commit()
+    except Exception:
+        if commit:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    with db_connection(commit=True) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                title       TEXT    NOT NULL,
+                searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title   TEXT    NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                query      TEXT    PRIMARY KEY,
+                data       TEXT    NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS history_user_idx ON history (user_id)"
         )
-    except Exception as exc:
-        LOGGER.error(
-            "Could not notify master about %s: %s",
-            subject,
-            exc,
-        )
-
-
-def supabase_request(
-    table: str,
-    method: str = "GET",
-    query: dict[str, str] | None = None,
-    payload: object | None = None,
-) -> list[dict]:
-    if not supabase_enabled():
-        raise RuntimeError("Supabase is not configured")
-
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-
-    if query:
-        url += "?" + urlencode(query)
-
-    request = Request(
-        url,
-        data=None if payload is None else json.dumps(payload).encode(),
-        method=method,
-        headers={
-            "apikey": SUPABASE_KEY,
-            "Authorization": "Bearer " + SUPABASE_KEY,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Prefer": "return=representation,resolution=merge-duplicates",
-        },
-    )
-
-    try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            result = json.loads(response.read().decode() or "[]")
-    except HTTPError as exc:
-        raise HTTPError(
-            exc.url,
-            exc.code,
-            f"Supabase {method} {table} failed with HTTP {exc.code}",
-            exc.headers,
-            exc.fp,
-        ) from exc
-
-    if not isinstance(result, list):
-        raise RuntimeError("Unexpected Supabase response")
-
-    return result
-
-
-def remote_cache_get(key: str) -> list[tuple[str, str]] | None:
-    rows = supabase_request(
-        "bot_cache",
-        query={
-            "query": f"eq.{key}",
-            "select": "response,created_at",
-            "limit": "1",
-        },
-    )
-
-    if not rows:
-        return None
-
-    if int(time.time()) - int(rows[0]["created_at"]) >= CACHE_TTL:
-        return None
-
-    cached = [tuple(item) for item in rows[0]["response"]]
-    return cached or None
-
-
-def remote_cache_put(
-    key: str,
-    results: list[tuple[str, str]],
-) -> None:
-    if not results:
-        return
-
-    supabase_request(
-        "bot_cache",
-        method="POST",
-        payload={
-            "query": key,
-            "response": results,
-            "created_at": int(time.time()),
-        },
-    )
-
-
-def remote_add_history(
-    chat_id: int,
-    title: str,
-    category: str,
-) -> None:
-    supabase_request(
-        "bot_history",
-        method="POST",
-        payload={
-            "chat_id": chat_id,
-            "title": title,
-            "category": category,
-            "created_at": int(time.time()),
-        },
-    )
-
-
-def remote_save_favorite(
-    chat_id: int,
-    title: str,
-    url: str,
-) -> None:
-    supabase_request(
-        "bot_favorites",
-        method="POST",
-        payload={
-            "chat_id": chat_id,
-            "title": title,
-            "url": url,
-            "created_at": int(time.time()),
-        },
-    )
-
-
-def remote_list_favorites(
-    chat_id: int,
-) -> list[tuple[str, str]]:
-    rows = supabase_request(
-        "bot_favorites",
-        query={
-            "chat_id": f"eq.{chat_id}",
-            "select": "title,url",
-            "order": "created_at.desc",
-            "limit": "20",
-        },
-    )
-
-    return [(row["title"], row["url"]) for row in rows]
-
-
-def remote_list_history(
-    chat_id: int,
-) -> list[tuple[str, str]]:
-    rows = supabase_request(
-        "bot_history",
-        query={
-            "chat_id": f"eq.{chat_id}",
-            "select": "title,category",
-            "order": "created_at.desc",
-            "limit": "20",
-        },
-    )
-
-    return [(row["title"], row["category"]) for row in rows]
-
-
-def first_start_needed() -> bool:
-    if supabase_enabled():
-        try:
-            return not bool(
-                supabase_request(
-                    "bot_meta",
-                    query={
-                        "key": "eq.first_start",
-                        "select": "value",
-                        "limit": "1",
-                    },
-                )
-            )
-        except (
-            HTTPError,
-            URLError,
-            OSError,
-            KeyError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            LOGGER.warning(
-                "Could not check remote first-start state: %s",
-                exc,
-            )
-
-    return not FIRST_START_FILE.exists()
-
-
-def mark_first_start_complete() -> None:
-    if supabase_enabled():
-        try:
-            supabase_request(
-                "bot_meta",
-                method="POST",
-                payload={
-                    "key": "first_start",
-                    "value": "complete",
-                },
-            )
-            return
-        except (
-            HTTPError,
-            URLError,
-            OSError,
-            KeyError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            LOGGER.warning(
-                "Could not save remote first-start state: %s",
-                exc,
-            )
-
-    try:
-        FIRST_START_FILE.touch()
-    except OSError as exc:
-        LOGGER.warning(
-            "Could not save local first-start state: %s",
-            exc,
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS cache_created_idx ON cache (created_at)"
         )
 
 
-def remote_delete_all() -> None:
-    remote_delete("all")
+def save_history(user_id: int, title: str) -> None:
+    supabase.table("history").insert({
+        "user_id": user_id,
+        "title": title
+    }).execute()
 
 
-def remote_delete(scope: str) -> None:
-    tables = {
-        "cache": (("bot_cache", "query"),),
-        "storage": (
-            ("bot_history", "id"),
-            ("bot_favorites", "id"),
-        ),
-        "all": (
-            ("bot_cache", "query"),
-            ("bot_history", "id"),
-            ("bot_favorites", "id"),
-        ),
-    }
-
-    for table, column in tables[scope]:
-        supabase_request(
-            table,
-            method="DELETE",
-            query={column: "not.is.null"},
-        )
-
-
-def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_FILE, timeout=10)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS history "
-        "(chat_id INTEGER, title TEXT, category TEXT, created_at INTEGER)"
+def get_history(user_id: int) -> List[Tuple[str, str]]:
+    response = (
+        supabase.table("history")
+        .select("title,searched_at")
+        .eq("user_id", user_id)
+        .order("searched_at", desc=True)
+        .limit(10)
+        .execute()
     )
 
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS favorites "
-        "(chat_id INTEGER, title TEXT, url TEXT, created_at INTEGER, "
-        "PRIMARY KEY (chat_id, title, url))"
-    )
-
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS cache "
-        "(query TEXT PRIMARY KEY, response TEXT, created_at INTEGER)"
-    )
-
-    connection.commit()
-    return connection
-
-
-def delete_local(scope: str) -> None:
-    connection = db()
-
-    tables = {
-        "cache": ("cache",),
-        "storage": ("history", "favorites"),
-        "all": ("cache", "history", "favorites"),
-    }
-
-    for table in tables[scope]:
-        connection.execute(f"DELETE FROM {table}")
-
-    connection.commit()
-    connection.close()
-
-
-def master_keyboard() -> dict:
-    return {
-        "keyboard": [
-            [{"text": "/masterstatus"}],
-            [
-                {"text": "/deletecache"},
-                {"text": "/deletestorage"},
-            ],
-            [{"text": "/deleteall"}],
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-    }
-
-
-def public_commands() -> list[dict[str, str]]:
     return [
-        {"command": command, "description": description}
-        for command, description in (
-            ("start", "Show help"),
-            ("movie", "Search for a movie"),
-            ("tv", "Search for a TV show"),
-            ("anime", "Search for anime"),
-            ("game", "Search for a game"),
-            ("sites", "Show configured sites"),
-            ("favorites", "Show favorites"),
-            ("history", "Show search history"),
+        (row["title"], row["searched_at"])
+        for row in response.data
+    ]
+
+
+def add_favorite(user_id: int, title: str) -> None:
+    supabase.table("favorites").insert({
+        "user_id": user_id,
+        "title": title
+    }).execute()
+
+
+def remove_favorite(user_id: int, title: str) -> None:
+    (
+        supabase.table("favorites")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("title", title)
+        .execute()
+    )
+
+
+def get_favorites(user_id: int) -> List[Tuple[str]]:
+    response = (
+        supabase.table("favorites")
+        .select("title")
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+    return [(row["title"],) for row in response.data]
+
+# ─── Cache helpers ────────────────────────────────────────────────────────────
+
+def make_cache_key(prefix: str, query: str) -> Optional[str]:
+    normalized = normalize_title(query)
+    if not normalized:
+        return None
+    return f"{prefix}:{normalized}"
+
+
+def get_cached(cache_key: str) -> Optional[Any]:
+    response = (
+        supabase.table("cache")
+        .select("data,created_at")
+        .eq("query", cache_key)
+        .execute()
+    )
+
+    if not response.data:
+        return None
+
+    row = response.data[0]
+
+    if time.time() - int(row["created_at"]) > CACHE_DURATION:
+        (
+            supabase.table("cache")
+            .delete()
+            .eq("query", cache_key)
+            .execute()
         )
-    ]
+        return None
 
-
-def master_commands() -> list[dict[str, str]]:
-    return public_commands() + [
-        {
-            "command": "masterstatus",
-            "description": "Show bot status",
-        },
-        {
-            "command": "deletecache",
-            "description": "Delete cache (password required)",
-        },
-        {
-            "command": "deletestorage",
-            "description": "Delete storage (password required)",
-        },
-        {
-            "command": "deleteall",
-            "description": "Delete everything (password required)",
-        },
-    ]
-
-
-def load_sites() -> dict[str, list[str]]:
     try:
-        data = json.loads(
-            SITES_FILE.read_text(encoding="utf-8")
-        )
+        return json.loads(row["data"])
+    except Exception:
+        return None
 
-        return {
-            key: [
-                url
-                for url in urls
-                if valid_site(url)
-            ]
-            for key, urls in data.items()
-            if isinstance(urls, list)
-        }
-    except (OSError, ValueError) as exc:
-        LOGGER.error(
-            "Could not read %s: %s",
+
+def save_cache(cache_key: str, data: Any) -> None:
+    supabase.table("cache").upsert({
+        "query": cache_key,
+        "data": json.dumps(data),
+        "created_at": int(time.time())
+    }).execute()
+
+
+def cache_empty_result(cache_key: str) -> None:
+    save_cache(cache_key, CACHE_EMPTY_MARKER)
+
+
+def cleanup_cache() -> int:
+    cutoff = int(time.time()) - CACHE_DURATION
+
+    response = (
+        supabase.table("cache")
+        .delete()
+        .lt("created_at", cutoff)
+        .execute()
+    )
+
+    return len(response.data) if response.data else 0
+
+
+def is_empty_cache(cached: Any) -> bool:
+    return isinstance(cached, dict) and bool(cached.get("_empty"))
+
+
+def resolve_cached_category_results(cached_payload: Any) -> Dict[str, str]:
+    if is_empty_cache(cached_payload):
+        return {}
+    if isinstance(cached_payload, dict):
+        return cached_payload
+    return {}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Token / user-data helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_title_token(title: str) -> Optional[str]:
+    normalized = normalize_title(title)
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+def store_token(
+    context: ContextTypes.DEFAULT_TYPE,
+    bucket: str,
+    token: str,
+    value: str,
+    max_entries: int = TOKEN_CACHE_LIMIT,
+) -> Optional[str]:
+    if not token:
+        return None
+    store = context.user_data.get(bucket)
+    if not isinstance(store, OrderedDict):
+        store = OrderedDict(store or {})
+        context.user_data[bucket] = store
+    store.move_to_end(token) if token in store else None
+    store[token] = value
+    while len(store) > max_entries:
+        store.popitem(last=False)
+    return token
+
+
+def get_token_value(
+    context: ContextTypes.DEFAULT_TYPE,
+    bucket: str,
+    token: str,
+) -> Optional[str]:
+    store = context.user_data.get(bucket)
+    if isinstance(store, (dict, OrderedDict)):
+        return store.get(token)
+    return None
+
+
+def reset_search_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (
+        "results", "category_results", "category_pages", "category_cache_keys",
+        "current_title", "raw_title", "current_tmdb_info", "current_title_key",
+        "current_category", "current_title_token", "main_caption",
+        "current_is_tv", "current_seasons", "ott_results",
+    ):
+        context.user_data.pop(key, None)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Title / URL utilities
+# ════════════════════════════════════════════════════════════════════════════
+
+def normalize_title(title: str) -> str:
+    if not title:
+        return ""
+    text = title.lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"['']", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_site_domain(site: str) -> str:
+    if not site:
+        return ""
+    parsed = urlparse(site)
+    domain = parsed.netloc or parsed.path
+    return domain.lower().replace("www.", "")
+
+
+def is_valid_http_url(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def is_valid_title(title: str) -> bool:
+    if not isinstance(title, str):
+        return False
+    text = title.strip()
+    return bool(text) and len(text) <= MAX_TITLE_LENGTH
+
+
+def parse_advanced_query(query: str) -> Dict[str, Optional[str]]:
+    season_episode = re.search(r"(S\d+E\d+)", query, re.IGNORECASE)
+    season = re.search(r"Season\s+(\d+)", query, re.IGNORECASE)
+    year = re.search(r"(19\d{2}|20\d{2})", query)
+    return {
+        "query": query,
+        "season_episode": season_episode.group(1) if season_episode else None,
+        "season": season.group(1) if season else None,
+        "year": year.group(1) if year else None,
+    }
+
+
+def category_display_label(category: str) -> str:
+    meta = CATEGORY_META.get(category, CATEGORY_META[CATEGORY_MOVIE])
+    return f"{meta['icon']} {meta['label']}"
+
+
+def get_category_cache_prefix(category: str) -> str:
+    return f"{CACHE_PREFIX_MOVIE}:{category}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Sites loading
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_category_sites() -> Dict[str, List[str]]:
+    """
+    Load sites.json from the same directory as bot.py.
+    Returns a dict keyed by category; each value is a deduplicated list of URLs.
+    Logs a clear error if the file is missing or malformed.
+    """
+    try:
+        with open(SITES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.error(
+            "sites.json not found at %s. "
+            "Create it next to bot.py. Working dir: %s | Files: %s",
             SITES_FILE,
-            exc,
+            os.getcwd(),
+            os.listdir(os.getcwd()),
         )
+        return {}
+    except json.JSONDecodeError:
+        logger.error("sites.json at %s contains invalid JSON.", SITES_FILE)
+        return {}
+    except Exception:
+        logger.exception("Failed to load sites.json from %s", SITES_FILE)
+        return {}
+
+    if not isinstance(data, dict):
+        logger.error("sites.json must be a JSON object keyed by category.")
+        return {}
+
+    def normalize_sites(entries: Any) -> List[str]:
+        if not isinstance(entries, list):
+            return []
+        seen: Set[str] = set()
+        result = []
+        for site in entries:
+            if not isinstance(site, str) or not site.strip():
+                continue
+            domain = normalize_site_domain(site)
+            if domain and domain not in seen:
+                seen.add(domain)
+                result.append(site)
+        return result
+
+    loaded = {
+        CATEGORY_MOVIE: normalize_sites(data.get(CATEGORY_MOVIE, [])),
+        CATEGORY_TV:    normalize_sites(data.get(CATEGORY_TV,    [])),
+        CATEGORY_ANIME: normalize_sites(data.get(CATEGORY_ANIME, [])),
+        CATEGORY_GAME:  normalize_sites(data.get(CATEGORY_GAME,  [])),
+    }
+    total = sum(len(v) for v in loaded.values())
+    logger.info(
+        "Loaded sites.json: %d categories, %d sites total",
+        len(loaded),
+        total,
+    )
+    return loaded
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Category detection
+# ════════════════════════════════════════════════════════════════════════════
+
+def fetch_ddgs_results(ddgs: DDGS, query: str, max_results: int) -> List[Dict[str, Any]]:
+    """Materialise DDG results into a list; return [] on any failure."""
+    try:
+        raw = ddgs.text(query, max_results=max_results)
+        return list(raw or [])
+    except Exception:
+        logger.warning("DDG search failed for query: %s", query)
+        return []
+
+
+def detect_content_type(query: str) -> str:
+    """
+    Run a Wikipedia-biased DDG search to determine whether 'query' is a
+    TV show, anime, game, or movie. Defaults to CATEGORY_MOVIE on failure.
+    """
+    try:
+        with DDGS() as ddgs:
+            results = fetch_ddgs_results(ddgs, f"{query} wikipedia", 5)
+        text = " ".join(
+            r.get("title", "") + " " + r.get("body", "")
+            for r in results
+        ).lower()
+
+        # TV / anime / game checks ordered from most specific to least
+        if "tv series" in text or "television series" in text:
+            return CATEGORY_TV
+        if "anime" in text:
+            return CATEGORY_ANIME
+        if "video game" in text:
+            return CATEGORY_GAME
+        if "season" in text:
+            return CATEGORY_TV
+    except Exception:
+        logger.exception("Category detection failed for: %s", query)
+    return CATEGORY_MOVIE
+
+
+async def detect_category_with_cache(raw_title: str) -> str:
+    """Return a cached detection result or run detection and cache it."""
+    detect_key = make_cache_key(CACHE_PREFIX_DETECT, raw_title)
+    if detect_key:
+        cached = await asyncio.to_thread(get_cached, detect_key)
+        if isinstance(cached, str) and cached in CATEGORY_META:
+            return cached
+    detected = await asyncio.to_thread(detect_content_type, raw_title)
+    if detect_key:
+        await asyncio.to_thread(save_cache, detect_key, detected)
+    return detected
+
+
+async def resolve_detected_category(
+    raw_title: str,
+    info: Optional[Dict[str, Any]],
+    forced_category: Optional[str],
+) -> str:
+    """
+    Priority: forced_category → TMDB media_type → DDG-based detection.
+    Only calls DDG when TMDB gives no clear answer, saving a network round-trip.
+    """
+    if forced_category in CATEGORY_META:
+        return forced_category
+    if info:
+        media_type = info.get("media_type")
+        if media_type == "tv":
+            return CATEGORY_TV
+        if media_type == "movie":
+            return CATEGORY_MOVIE
+    return await detect_category_with_cache(raw_title)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TMDB
+# ════════════════════════════════════════════════════════════════════════════
+
+def get_tmdb_info(title: str) -> Optional[Dict[str, Any]]:
+    if not TMDB_API_KEY or not title:
+        return None
+    cache_key = make_cache_key(CACHE_PREFIX_TMDB, title)
+    if not cache_key:
+        return None
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return None if is_empty_cache(cached) else cached
+    try:
+        resp = HTTP_SESSION.get(
+            "https://api.themoviedb.org/3/search/multi",
+            params={"api_key": TMDB_API_KEY, "query": title, "include_adult": "true"},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            cache_empty_result(cache_key)
+            return None
+        results = data.get("results")
+        if not isinstance(results, list) or not results:
+            cache_empty_result(cache_key)
+            return None
+
+        aliases = [
+            item.get("title") or item.get("name")
+            for item in results[:5]
+            if item.get("title") or item.get("name")
+        ]
+        best = results[0]
+        if not isinstance(best, dict):
+            cache_empty_result(cache_key)
+            return None
+
+        media_type = best.get("media_type")
+        seasons: List[Any] = []
+        origin_country: List[str] = []
+        tmdb_id = best.get("id")
+
+        if media_type == "tv" and tmdb_id:
+            try:
+                tv_resp = HTTP_SESSION.get(
+                    f"https://api.themoviedb.org/3/tv/{tmdb_id}",
+                    params={"api_key": TMDB_API_KEY},
+                    timeout=HTTP_TIMEOUT,
+                )
+                tv_resp.raise_for_status()
+                tv_data = tv_resp.json()
+                if isinstance(tv_data, dict):
+                    seasons = tv_data.get("seasons") or []
+                    origin_country = tv_data.get("origin_country") or []
+            except Exception:
+                logger.exception("TMDB TV detail lookup failed for %s", title)
+
+        info: Dict[str, Any] = {
+            "title":            best.get("title") or best.get("name") or title,
+            "year":             (best.get("release_date") or best.get("first_air_date") or "")[:4],
+            "rating":           best.get("vote_average"),
+            "overview":         best.get("overview"),
+            "tmdb_id":          tmdb_id,
+            "poster":           (
+                f"https://image.tmdb.org/t/p/w500{best['poster_path']}"
+                if best.get("poster_path") else None
+            ),
+            "aliases":          aliases,
+            "media_type":       media_type,
+            "seasons":          seasons,
+            "genre_ids":        best.get("genre_ids") or [],
+            "original_language": best.get("original_language"),
+            "origin_country":   origin_country,
+        }
+        save_cache(cache_key, info)
+        return info
+    except Exception:
+        logger.exception("TMDB lookup failed for %s", title)
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OTT / watch providers
+# ════════════════════════════════════════════════════════════════════════════
+
+def normalize_provider_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def provider_is_available(normalized_short: str, normalized_names: Set[str]) -> bool:
+    if not normalized_short or not normalized_names:
+        return False
+    if normalized_short in normalized_names:
+        return True
+    return bool(PROVIDER_ALIASES.get(normalized_short, set()).intersection(normalized_names))
+
+
+def get_tmdb_watch_providers(tmdb_id: int, media_type: str) -> Dict[str, Any]:
+    if not TMDB_API_KEY or not tmdb_id or media_type not in SUPPORTED_TMDB_MEDIA_TYPES:
+        return {}
+    try:
+        resp = HTTP_SESSION.get(
+            f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/watch/providers",
+            params={"api_key": TMDB_API_KEY},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload.get("results", {}) if isinstance(payload, dict) else {}
+    except Exception:
+        logger.exception("TMDB watch provider lookup failed for id=%s", tmdb_id)
         return {}
 
 
-def valid_site(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-
-    parsed = urlparse(value)
-
-    return (
-        parsed.scheme in {"http", "https"}
-        and bool(parsed.netloc)
-    )
-
-
-SITES = load_sites()
-
-
-def save_local_history(
-    chat_id: int,
-    title: str,
-    category: str,
-) -> None:
-    connection = db()
-
-    connection.execute(
-        "INSERT INTO history(chat_id, title, category, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (
-            chat_id,
-            title,
-            category,
-            int(time.time()),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def save_local_favorite(
-    chat_id: int,
-    title: str,
-    url: str,
-) -> None:
-    connection = db()
-
-    connection.execute(
-        "INSERT OR IGNORE INTO favorites "
-        "(chat_id, title, url, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (
-            chat_id,
-            title,
-            url,
-            int(time.time()),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def local_list_favorites(
-    chat_id: int,
-) -> list[tuple[str, str]]:
-    connection = db()
-
-    rows = connection.execute(
-        "SELECT title, url FROM favorites "
-        "WHERE chat_id = ? "
-        "ORDER BY created_at DESC LIMIT 20",
-        (chat_id,),
-    ).fetchall()
-
-    connection.close()
-    return rows
-
-
-def local_list_history(
-    chat_id: int,
-) -> list[tuple[str, str]]:
-    connection = db()
-
-    rows = connection.execute(
-        "SELECT title, category FROM history "
-        "WHERE chat_id = ? "
-        "ORDER BY created_at DESC LIMIT 20",
-        (chat_id,),
-    ).fetchall()
-
-    connection.close()
-    return rows
-
-
-class LinkParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.links: list[tuple[str, str]] = []
-        self.current_href = ""
-        self.current_text: list[str] = []
-
-    def handle_starttag(
-        self,
-        tag: str,
-        attrs: list[tuple[str, str | None]],
-    ) -> None:
-        if tag.lower() == "a":
-            self.current_href = dict(attrs).get("href") or ""
-            self.current_text = []
-
-    def handle_data(self, data: str) -> None:
-        if self.current_href:
-            self.current_text.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "a" and self.current_href:
-            text = " ".join(
-                "".join(self.current_text).split()
-            )
-
-            self.links.append(
-                (self.current_href, text)
-            )
-
-            self.current_href = ""
-
-
-def fetch(url: str) -> str:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux armv7l) "
-                "AppleWebKit/537.36 "
-                "Chrome/120 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml"
-            ),
-        },
-    )
-
-    with urlopen(
-        request,
-        timeout=REQUEST_TIMEOUT,
-    ) as response:
-        return response.read(
-            512_000
-        ).decode(
-            "utf-8",
-            errors="replace",
-        )
-
-
-def normalise_domain(value: str) -> str:
-    parsed = urlparse(value)
-    domain = parsed.netloc.lower().split(":")[0].rstrip(".")
-
-    if domain.startswith("www."):
-        domain = domain[4:]
-
-    return domain
-
-
-def extract_redirected_url(url: str) -> str:
-    parsed = urlparse(url)
-    host = parsed.netloc.lower().split(":")[0]
-
-    if host.endswith("duckduckgo.com"):
-        redirected = parse_qs(
-            parsed.query
-        ).get("uddg", [])
-
-        if redirected:
-            return redirected[0]
-
-    if host.endswith("bing.com"):
-        redirected = parse_qs(
-            parsed.query
-        ).get("u", [])
-
-        if redirected:
-            return redirected[0]
-
-    return url
-
-
-def filter_site_results(
-    links: list[tuple[str, str]],
-    domain: str,
-    title: str,
-    base_url: str,
-) -> list[tuple[str, str]]:
-    results: list[tuple[str, str]] = []
-
-    for href, text in links:
-        absolute = urljoin(base_url, href)
-        absolute = extract_redirected_url(absolute)
-
-        if not absolute.startswith(
-            ("http://", "https://")
-        ):
-            continue
-
-        if normalise_domain(absolute) != domain:
-            continue
-
-        label = text or title
-
-        if absolute not in {
-            url
-            for url, _ in results
-        }:
-            results.append(
-                (absolute, label[:120])
-            )
-
-    return results[:2]
-
-
-def search_site(
-    site: str,
-    title: str,
-    category: str,
-) -> list[tuple[str, str]]:
-    del category
-
-    domain = normalise_domain(site)
-    query = quote_plus(
-        f'site:{domain} "{title}"'
-    )
-
-    search_urls = (
-        (
-            "https://html.duckduckgo.com/html/"
-            f"?q={query}"
-        ),
-        (
-            "https://lite.duckduckgo.com/lite/"
-            f"?q={query}"
-        ),
-        (
-            "https://www.bing.com/search"
-            f"?q={query}"
-        ),
-    )
-
-    for search_url in search_urls:
-        try:
-            parser = LinkParser()
-            html_text = fetch(search_url)
-            parser.feed(html_text)
-
-            results = filter_site_results(
-                parser.links,
-                domain,
-                title,
-                search_url,
-            )
-
-            # Do not stop merely because the provider returned links.
-            # Stop only when links actually belong to the requested site.
-            if results:
-                return results
-
-        except (
-            HTTPError,
-            URLError,
-            TimeoutError,
-            ValueError,
-        ) as exc:
-            LOGGER.debug(
-                "Search failed for %s via %s: %s",
-                domain,
-                search_url,
-                exc,
-            )
-
-    return []
-
-
-def search(
-    title: str,
-    category: str,
-) -> list[tuple[str, str]]:
-    key = f"{category}:{title.lower().strip()}"
-    remote_failed = False
-
-    if supabase_enabled():
-        try:
-            cached = remote_cache_get(key)
-
-            if cached is not None:
-                return cached
-
-        except (
-            HTTPError,
-            URLError,
-            OSError,
-            KeyError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            LOGGER.warning(
-                "Supabase cache read failed; "
-                "using local SQLite: %s",
-                exc,
-            )
-
-            notify_master(
-                "Supabase unavailable",
-                "Cache read failed; local fallback enabled.\n"
-                f"{exc}",
-            )
-
-            remote_failed = True
-
-    connection: sqlite3.Connection | None = None
-
-    if not supabase_enabled() or remote_failed:
-        connection = db()
-
-        row = connection.execute(
-            "SELECT response, created_at FROM cache "
-            "WHERE query = ?",
-            (key,),
-        ).fetchone()
-
-        if row and int(time.time()) - row[1] < CACHE_TTL:
-            cached = [
-                tuple(item)
-                for item in json.loads(row[0])
-            ]
-
-            if cached:
-                connection.close()
-                return cached
-
-    sites = SITES.get(category, [])
-    results: list[tuple[str, str]] = []
-
-    for batch_start in range(
-        0,
-        len(sites),
-        MAX_SEARCH_SITES,
-    ):
-        if (
-            batch_start // MAX_SEARCH_SITES
-            >= MAX_SEARCH_BATCHES
-        ):
-            break
-
-        batch = sites[
-            batch_start:batch_start + MAX_SEARCH_SITES
-        ]
-
-        with ThreadPoolExecutor(
-            max_workers=min(
-                4,
-                max(1, len(batch)),
-            )
-        ) as pool:
-            futures = [
-                pool.submit(
-                    search_site,
-                    site,
-                    title,
-                    category,
-                )
-                for site in batch
-            ]
-
-            for future in as_completed(futures):
-                try:
-                    results.extend(
-                        future.result()
-                    )
-                except Exception as exc:
-                    LOGGER.warning(
-                        "Search worker failed: %s",
-                        exc,
-                    )
-
-                if len(results) >= MAX_RESULTS:
-                    break
-
-        if len(results) >= MAX_RESULTS:
-            break
-
-    results = results[:MAX_RESULTS]
-
-    if supabase_enabled() and results:
-        try:
-            remote_cache_put(key, results)
-            return results
-
-        except (
-            HTTPError,
-            URLError,
-            OSError,
-            KeyError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            LOGGER.warning(
-                "Supabase cache write failed; "
-                "using local SQLite: %s",
-                exc,
-            )
-
-            notify_master(
-                "Supabase unavailable",
-                "Cache write failed; local fallback enabled.\n"
-                f"{exc}",
-            )
-
-            if connection is None:
-                connection = db()
-
-    if connection is None:
-        connection = db()
-
-    if results:
-        connection.execute(
-            "INSERT OR REPLACE INTO cache "
-            "(query, response, created_at) "
-            "VALUES (?, ?, ?)",
-            (
-                key,
-                json.dumps(results),
-                int(time.time()),
-            ),
-        )
-
-        connection.commit()
-
-    connection.close()
-    return results
-
-
-def telegram(
-    method: str,
-    **params: object,
-) -> object:
-    request = Request(
-        TELEGRAM_API.format(
-            BOT_TOKEN,
-            method,
-        ),
-        data=json.dumps(params).encode(),
-        headers={
-            "Content-Type": "application/json",
-        },
-    )
-
-    api_timeout = max(
-        REQUEST_TIMEOUT + 20,
-        int(params.get("timeout", 0)) + 20,
-    )
-
-    with urlopen(
-        request,
-        timeout=api_timeout,
-    ) as response:
-        payload = json.loads(
-            response.read().decode()
-        )
-
-    if not payload.get("ok"):
-        raise RuntimeError(
-            payload.get(
-                "description",
-                "Telegram API request failed",
-            )
-        )
-
-    return payload.get("result")
-
-
-def send(
-    chat_id: int,
-    text: str,
-    reply_markup: dict | None = None,
-) -> None:
-    params: dict[str, object] = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-
-    if reply_markup is not None:
-        params["reply_markup"] = reply_markup
-
-    telegram(
-        "sendMessage",
-        **params,
-    )
-
-
-def escape(text: str) -> str:
-    return html.escape(
-        text,
-        quote=False,
-    )
-
-
-def category_command(command: str) -> str:
+def extract_provider_names(country_data: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    for key in ("flatrate", "ads", "free", "rent", "buy"):
+        for entry in country_data.get(key) or []:
+            if isinstance(entry, dict) and entry.get("provider_name"):
+                names.append(entry["provider_name"])
+    return names
+
+
+def shorten_ott_provider_name(provider_name: str, country_code: str) -> str:
+    country_name = COUNTRY_INFO.get(country_code, {}).get("name", "")
+    short = provider_name
+    if country_name and short.endswith(f" {country_name}"):
+        short = short[:-(len(country_name) + 1)]
+    for alias in ("USA", "UK"):
+        if short.endswith(f" {alias}"):
+            short = short[:-(len(alias) + 1)]
+    return short.strip()
+
+
+def build_ott_provider_result(
+    country_code: str,
+    provider_name: str,
+    url: Optional[str],
+) -> Dict[str, Any]:
     return {
-        "movie": "movie",
-        "tv": "tv",
-        "anime": "anime",
-        "game": "game",
-    }.get(command, "movie")
-
-
-def delete_for_master(
-    chat_id: int,
-    command: str,
-) -> None:
-    scope = {
-        "deletecache": "cache",
-        "deletestorage": "storage",
-        "deleteall": "all",
-    }[command]
-
-    failures = []
-
-    try:
-        if supabase_enabled():
-            remote_delete(scope)
-
-    except (
-        HTTPError,
-        URLError,
-        OSError,
-        KeyError,
-        ValueError,
-        RuntimeError,
-        sqlite3.Error,
-    ) as exc:
-        LOGGER.exception(
-            "Remote delete operation failed"
-        )
-        failures.append(f"remote: {exc}")
-
-    try:
-        delete_local(scope)
-
-    except sqlite3.Error as exc:
-        LOGGER.exception(
-            "Local delete operation failed"
-        )
-        failures.append(f"local: {exc}")
-
-    if failures:
-        notify_master(
-            f"Delete {scope} failed",
-            "\n".join(failures),
-        )
-
-        send(
-            chat_id,
-            "Deletion was incomplete. "
-            "The master has been notified.",
-        )
-        return
-
-    labels = {
-        "cache": "cache",
-        "storage": "history and favorites",
-        "all": "history, favorites, and caches",
+        "name":         provider_name,
+        "display_name": shorten_ott_provider_name(provider_name, country_code),
+        "available":    bool(url),
+        "status":       "Available" if url else "Unavailable",
+        "url":          url,
     }
 
-    send(
-        chat_id,
-        f"Deleted {labels[scope]}.",
+
+def build_empty_ott_results() -> Dict[str, List[Dict[str, Any]]]:
+    return {
+        country_code: [
+            build_ott_provider_result(country_code, name, None)
+            for name in providers
+        ]
+        for country_code, providers in OTT_SITES.items()
+    }
+
+
+def search_ott(
+    title: str,
+    tmdb_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    info = tmdb_info if tmdb_info is not None else get_tmdb_info(title)
+    if not info:
+        return build_empty_ott_results()
+
+    tmdb_id = info.get("tmdb_id")
+    media_type = info.get("media_type")
+    if not tmdb_id or media_type not in SUPPORTED_TMDB_MEDIA_TYPES:
+        return build_empty_ott_results()
+
+    tmdb_results = get_tmdb_watch_providers(tmdb_id, media_type)
+    found: Dict[str, List[Dict[str, Any]]] = {}
+    for country_code, providers in OTT_SITES.items():
+        country_data = tmdb_results.get(country_code, {})
+        provider_names = extract_provider_names(country_data)
+        normalized_names = {normalize_provider_name(n) for n in provider_names if n}
+        found[country_code] = []
+        for provider_name, site in providers.items():
+            short_name = shorten_ott_provider_name(provider_name, country_code)
+            available = provider_is_available(normalize_provider_name(short_name), normalized_names)
+            found[country_code].append(
+                build_ott_provider_result(country_code, provider_name, site if available else None)
+            )
+    return found
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Site search (parallelised per-category)
+# ════════════════════════════════════════════════════════════════════════════
+
+def search_category_site(title: str, site: str) -> Optional[Tuple[str, str]]:
+    """
+    Search a single site for *title*.
+    Returns (domain, url) on success, None otherwise.
+    Two query variants are tried; the first good hit wins.
+    """
+    site_domain = normalize_site_domain(site)
+    if not site_domain:
+        return None
+    queries = [
+        f'"{title}" site:{site_domain}',
+        f"{title} site:{site_domain}",
+    ]
+    try:
+        with DDGS() as ddgs:
+            for query in queries:
+                logger.debug("DDG query: %s", query)
+                results = fetch_ddgs_results(ddgs, query, MAX_SEARCH_RESULTS)
+                logger.info(f"QUERY: {query}")
+                logger.info(f"RESULTS COUNT: {len(results)}")
+
+                for r in results[:3]:
+                    logger.info(f"RESULT: {r}")
+                logger.debug("DDG returned %d results for %s", len(results), site_domain)
+                for item in results:
+                    href = item.get("href") or item.get("url")
+                    if not href or not is_valid_http_url(href):
+                        continue
+                    if site_domain in normalize_site_domain(href):
+                        logger.info("Hit: %s → %s", site_domain, href)
+                        return site_domain, href
+    except Exception:
+        logger.exception("search_category_site failed: title=%s site=%s", title, site_domain)
+    return None
+
+
+def search_category_sites(title: str, category: str) -> Dict[str, str]:
+    """
+    Search all sites for *category* in parallel using a thread pool.
+    A single failing worker does not abort the whole search.
+    Returns a dict of {domain: url}.
+    """
+    if not title:
+        return {}
+    sites = load_category_sites().get(category, [])
+    logger.info("search_category_sites: category=%s sites=%d", category, len(sites))
+    if not sites:
+        return {}
+
+    found: Dict[str, str] = {}
+    max_workers = min(8, len(sites))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_site = {
+            executor.submit(search_category_site, title, site): site
+            for site in sites
+        }
+        for future in as_completed(future_to_site):
+            site = future_to_site[future]
+            try:
+                result = future.result()
+            except Exception:
+                # BUG FIX: individual worker failure must not crash the search
+                logger.exception(
+                    "Worker failed for title=%s site=%s — skipping",
+                    title,
+                    normalize_site_domain(site),
+                )
+                continue
+            if result:
+                domain, href = result
+                found[domain] = href
+
+    logger.info("search_category_sites: found %d results for %s", len(found), title)
+    return found
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OTT text / keyboard formatting
+# ════════════════════════════════════════════════════════════════════════════
+
+def format_ott_text(title: str, ott_results: Dict[str, List[Dict[str, Any]]]) -> str:
+    summary = (
+        "✅ Available on tracked platforms"
+        if has_ott_availability(ott_results)
+        else "❌ Not available on tracked platforms"
+    )
+    lines = [f"📺 OTT Availability for {title}", summary, ""]
+    for country_code, providers in ott_results.items():
+        country = COUNTRY_INFO.get(country_code, {"flag": "🏳️", "name": country_code})
+        lines.append(f"{country['flag']} {country['name']}")
+        for provider in providers:
+            icon = "✅" if provider["available"] else "❌"
+            lines.append(f"  • {provider['display_name']} — {icon} {provider['status']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def build_ott_keyboard(ott_results: Dict[str, List[Dict[str, Any]]]) -> InlineKeyboardMarkup:
+    keyboard = []
+    for country_code, providers in ott_results.items():
+        country = COUNTRY_INFO.get(country_code, {"flag": "🏳️", "name": country_code})
+        for provider in providers:
+            if provider["available"]:
+                keyboard.append([InlineKeyboardButton(
+                    f"{country['flag']} {provider['display_name']}",
+                    url=provider["url"],
+                )])
+    keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back:main")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def has_ott_availability(ott_results: Dict[str, List[Dict[str, Any]]]) -> bool:
+    return any(
+        p["available"]
+        for providers in ott_results.values()
+        for p in providers
     )
 
 
-def handle_message(message: dict) -> None:
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    text = (message.get("text") or "").strip()
+# ════════════════════════════════════════════════════════════════════════════
+# Episode guide formatting
+# ════════════════════════════════════════════════════════════════════════════
 
-    if not isinstance(chat_id, int) or not text:
+def format_season_label(season: Dict[str, Any]) -> str:
+    number = season.get("season_number")
+    if number is None:
+        return "📺 Season"
+    count = season.get("episode_count")
+    return f"📺 Season {number} ({count} eps)" if count else f"📺 Season {number}"
+
+
+def format_episode_guide_text(title: str, seasons: List[Dict[str, Any]]) -> str:
+    lines = [f"📚 Episode Guide for {title}", ""]
+    valid = [s for s in seasons if isinstance(s, dict) and s.get("season_number") is not None]
+    if not valid:
+        lines.append("❌ No season data available.")
+        return "\n".join(lines)
+    for season in valid:
+        lines.append(format_season_label(season))
+    return "\n".join(lines)
+
+
+def build_episode_guide_keyboard(seasons: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    keyboard: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for season in seasons:
+        if not isinstance(season, dict):
+            continue
+        number = season.get("season_number")
+        if number is None:
+            continue
+        row.append(InlineKeyboardButton(
+            f"📺 Season {number}",
+            callback_data=f"season:{number}",
+        ))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("⬅ Back", callback_data="back:main")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Main results keyboard
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_main_keyboard(
+    all_results: List[Tuple[str, str]],
+    current_title: str,
+    page: int = 0,
+    show_episode_guide: bool = False,
+    active_category: str = CATEGORY_MOVIE,
+    title_token: Optional[str] = None,
+) -> List[List[InlineKeyboardButton]]:
+    def _category_label(cat: str) -> str:
+        meta = CATEGORY_META[cat]
+        text = f"{meta['icon']} {meta['label']}"
+        return f"✅ {text}" if cat == active_category else text
+
+    fav_cb = f"fav:{title_token}" if title_token else "fav"
+    ott_cb = f"ott:{title_token}" if title_token else "ott"
+
+    keyboard: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("⭐ Favorite", callback_data=fav_cb),
+            InlineKeyboardButton("📺 OTT",      callback_data=ott_cb),
+        ],
+        [
+            InlineKeyboardButton(_category_label(CATEGORY_MOVIE), callback_data=f"cat:{CATEGORY_MOVIE}"),
+            InlineKeyboardButton(_category_label(CATEGORY_TV),    callback_data=f"cat:{CATEGORY_TV}"),
+        ],
+        [
+            InlineKeyboardButton(_category_label(CATEGORY_ANIME), callback_data=f"cat:{CATEGORY_ANIME}"),
+            InlineKeyboardButton(_category_label(CATEGORY_GAME),  callback_data=f"cat:{CATEGORY_GAME}"),
+        ],
+    ]
+    if show_episode_guide:
+        keyboard.append([
+            InlineKeyboardButton("📚 Episode Guide", callback_data="guide:episodes")
+        ])
+
+    start = page * RESULTS_PER_PAGE
+    end   = start + RESULTS_PER_PAGE
+    for domain, url in all_results[start:end]:
+        keyboard.append([InlineKeyboardButton(BUTTON_NAMES.get(domain, domain), url=url)])
+
+    nav: List[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅ Previous", callback_data="prev"))
+    if end < len(all_results):
+        nav.append(InlineKeyboardButton("Next ➡", callback_data="next"))
+    if nav:
+        keyboard.append(nav)
+    return keyboard
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Telegram safety wrapper
+# ════════════════════════════════════════════════════════════════════════════
+
+async def safe_telegram_call(action: Awaitable[Any], description: str) -> Any:
+    try:
+        return await action
+    except BadRequest as exc:
+        logger.warning("Telegram BadRequest [%s]: %s", description, exc)
+    except Exception:
+        logger.exception("Telegram error [%s]", description)
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Caption builder
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_results_caption(
+    raw_title: str,
+    info: Optional[Dict[str, Any]],
+    category: str,
+) -> str:
+    label = category_display_label(category)
+    if info:
+        display = info.get("title") or raw_title
+        caption = f"🎬 <b>{display}"
+        year = info.get("year")
+        if year:
+            caption += f" ({year})"
+        caption += "</b>\n"
+        caption += f"🧭 Category: {label}\n"
+        rating = info.get("rating")
+        if isinstance(rating, (int, float)) and 0 <= rating <= MAX_TMDB_RATING:
+            caption += f"⭐ {rating:.1f}/{MAX_TMDB_RATING}\n"
+        overview = info.get("overview") or ""
+        if overview:
+            if len(overview) > MAX_OVERVIEW_LENGTH:
+                overview = overview[:MAX_OVERVIEW_LENGTH] + "..."
+            caption += f"\n{overview}\n"
+    else:
+        caption = f'🎬 <b>Results for "{raw_title}"</b>\n🧭 Category: {label}\n'
+    caption += "\n🔗 Select a source below:"
+    return caption
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Pagination / category state helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def get_category_page(context: ContextTypes.DEFAULT_TYPE, category: str) -> int:
+    return context.user_data.setdefault("category_pages", {}).get(category, 0)
+
+
+def set_category_page(context: ContextTypes.DEFAULT_TYPE, category: str, page: int) -> None:
+    context.user_data.setdefault("category_pages", {})[category] = page
+    context.user_data["page"] = page
+
+
+def get_results_for_category(
+    context: ContextTypes.DEFAULT_TYPE,
+    category: str,
+) -> Dict[str, str]:
+    return context.user_data.setdefault("category_results", {}).get(category, {})
+
+
+def set_active_category(context: ContextTypes.DEFAULT_TYPE, category: str) -> None:
+    results = get_results_for_category(context, category)
+    all_results = list(results.items())
+    page = get_category_page(context, category)
+    max_page = max(0, (len(all_results) - 1) // RESULTS_PER_PAGE) if all_results else 0
+    page = max(0, min(page, max_page))
+    set_category_page(context, category, page)
+    raw_title = context.user_data.get("raw_title") or context.user_data.get("current_title", "")
+    info = context.user_data.get("current_tmdb_info")
+    context.user_data["results"] = all_results
+    context.user_data["current_category"] = category
+    context.user_data["main_caption"] = build_results_caption(raw_title, info, category)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Command handlers
+# ════════════════════════════════════════════════════════════════════════════
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
         return
+    await update.message.reply_text(
+        "🎬 Welcome to Movie Search Bot!\n\n"
+        "Send any title for automatic category detection.\n"
+        "Or use /movie, /tv, /anime, /game.\n"
+        "Example: Inception"
+    )
 
-    command, _, argument = text.partition(" ")
-    command = command.lstrip("/").split("@", 1)[0].lower()
 
-    pending = _pending_passwords.get(chat_id)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "📖 How to use this bot:\n\n"
+        "1. Send any title to auto-detect (Movie/TV/Anime/Game).\n"
+        "2. Or use:\n"
+        "   • /movie <title>\n"
+        "   • /tv <title>\n"
+        "   • /anime <title>\n"
+        "   • /game <title>\n\n"
+        "Examples:\n"
+        "• Inception\n"
+        "• /movie Interstellar\n"
+        "• /anime Attack on Titan\n"
+        "• /game GTA 5"
+    )
 
-    if pending:
-        pending_command, created_at = pending
 
-        if time.time() - created_at >= PASSWORD_PROMPT_TTL:
-            _pending_passwords.pop(chat_id, None)
-
-            send(
-                chat_id,
-                "Password prompt expired. "
-                "Please start the delete command again.",
+async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    try:
+        sites_by_cat = await asyncio.to_thread(load_category_sites)
+        if not sites_by_cat:
+            await update.message.reply_text(
+                "❌ No sites configured. Check that sites.json exists next to bot.py."
             )
             return
+        lines = ["🌐 Configured Sites\n"]
+        for cat, sites in sites_by_cat.items():
+            lines.append(f"📂 {cat.upper()} ({len(sites)})")
+            for site in sites:
+                lines.append(f"  • {normalize_site_domain(site)}")
+            lines.append("")
+        await update.message.reply_text("\n".join(lines))
+    except Exception:
+        logger.exception("sites_command failed")
+        await update.message.reply_text("❌ Could not load configured sites.")
 
-        if command not in {
-            "deletecache",
-            "deletestorage",
-            "deleteall",
-        }:
-            _pending_passwords.pop(
-                chat_id,
-                None,
+
+def get_command_query(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return " ".join(context.args).strip() if context.args else ""
+
+
+async def execute_search(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_title: str,
+    forced_category: Optional[str] = None,
+) -> None:
+    if not update.message:
+        return
+    if not is_valid_title(raw_title):
+        await update.message.reply_text(
+            f"❌ Please keep titles under {MAX_TITLE_LENGTH} characters."
+        )
+        return
+
+    await asyncio.to_thread(save_history, update.message.from_user.id, raw_title)
+    status = await safe_telegram_call(
+        update.message.reply_text("🔍 Searching..."),
+        "send status",
+    )
+
+    try:
+        parsed = parse_advanced_query(raw_title)
+        info = await asyncio.to_thread(get_tmdb_info, parsed["query"])
+        title = (info.get("title") if info else None) or raw_title
+        is_tv = bool(info and info.get("media_type") == "tv")
+        seasons = [
+            s for s in (info.get("seasons") or [])
+            if isinstance(s, dict) and s.get("season_number") is not None
+        ] if info else []
+
+        detected_category = await resolve_detected_category(raw_title, info, forced_category)
+
+        # Check cache before searching
+        cache_key = make_cache_key(get_category_cache_prefix(detected_category), title)
+        cached = await asyncio.to_thread(get_cached, cache_key) if cache_key else None
+        if cached is not None:
+            results = resolve_cached_category_results(cached)
+        else:
+            results = await asyncio.to_thread(search_category_sites, title, detected_category)
+            if cache_key:
+                await asyncio.to_thread(save_cache, cache_key, results or CACHE_EMPTY_MARKER)
+
+        if not results:
+            msg = f'❌ "{raw_title}" was not found on any configured sites.'
+            if status:
+                await safe_telegram_call(status.edit_text(msg), "edit status empty")
+            else:
+                await safe_telegram_call(update.message.reply_text(msg), "send empty")
+            return
+
+        caption = build_results_caption(raw_title, info, detected_category)
+        all_results = list(results.items())
+        normalized_title = normalize_title(title)
+        title_token = build_title_token(title) or ""
+
+        reset_search_state(context)
+        context.user_data.update({
+            "results":              all_results,
+            "category_results":     {detected_category: results},
+            "category_pages":       {cat: 0 for cat in SEARCH_CATEGORIES},
+            "category_cache_keys":  {detected_category: cache_key} if cache_key else {},
+            "current_title":        title,
+            "raw_title":            raw_title,
+            "current_tmdb_info":    info,
+            "current_title_key":    normalized_title,
+            "current_category":     detected_category,
+            "current_title_token":  title_token,
+            "main_caption":         caption,
+            "current_is_tv":        is_tv,
+            "current_seasons":      seasons,
+        })
+        if title_token:
+            store_token(context, "title_tokens", title_token, title)
+
+        keyboard = build_main_keyboard(
+            all_results, title,
+            page=0,
+            show_episode_guide=is_tv and bool(seasons),
+            active_category=detected_category,
+            title_token=title_token,
+        )
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if info and info.get("poster"):
+            sent = await safe_telegram_call(
+                update.message.reply_photo(
+                    photo=info["poster"],
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                ),
+                "send poster",
             )
-
-            if hmac.compare_digest(
-                text,
-                MASTER_DELETE_PASSWORD,
-            ):
-                delete_for_master(
-                    chat_id,
-                    pending_command,
+            if sent and status:
+                await safe_telegram_call(status.delete(), "delete status")
+            elif status:
+                await safe_telegram_call(
+                    status.edit_text(caption, parse_mode="HTML",
+                                     reply_markup=reply_markup,
+                                     disable_web_page_preview=True),
+                    "edit status fallback",
+                )
+        else:
+            target = status or None
+            if target:
+                await safe_telegram_call(
+                    target.edit_text(caption, parse_mode="HTML",
+                                     reply_markup=reply_markup,
+                                     disable_web_page_preview=True),
+                    "edit status",
                 )
             else:
-                send(
-                    chat_id,
-                    "Password required or invalid password.",
+                await safe_telegram_call(
+                    update.message.reply_text(caption, parse_mode="HTML",
+                                              reply_markup=reply_markup,
+                                              disable_web_page_preview=True),
+                    "send results",
                 )
-
-            return
-
-    if command in {"start", "help"}:
-        text = (
-            "Send a title or use /movie, /tv, /anime, "
-            "or /game followed by a title.\n"
-            "Save a result with "
-            "/favorite <title> | <url>."
-        )
-
-        send(
-            chat_id,
-            text,
-            (
-                master_keyboard()
-                if chat_id == MASTER_CHAT_ID
-                else None
-            ),
-        )
-        return
-
-    if command == "sites":
-        counts = ", ".join(
-            f"{key}: {len(value)}"
-            for key, value in SITES.items()
-        )
-
-        send(
-            chat_id,
-            f"Configured search sites: {counts or 'none'}",
-        )
-        return
-
-    if command == "masterstatus":
-        if chat_id != MASTER_CHAT_ID:
-            return
-
-        backend = (
-            "Supabase (remote-first)"
-            if supabase_enabled()
-            else "local SQLite"
-        )
-
-        uptime = int(time.time() - STARTED_AT)
-
-        send(
-            chat_id,
-            f"Master status\n"
-            f"Storage: {backend}\n"
-            f"Configured sites: "
-            f"{sum(map(len, SITES.values()))}\n"
-            f"Uptime: {uptime}s\n"
-            "Restricted actions require the password "
-            "every time.",
-            master_keyboard(),
-        )
-        return
-
-    if command in {
-        "deletecache",
-        "deletestorage",
-        "deleteall",
-    }:
-        if chat_id != MASTER_CHAT_ID:
-            send(
-                chat_id,
-                "This command is restricted to the bot master.",
-            )
-
-            notify_master(
-                "Unauthorized delete attempt",
-                f"Chat ID: {chat_id}",
-            )
-            return
-
-        password = argument.strip()
-
-        if not password:
-            _pending_passwords[chat_id] = (
-                command,
-                time.time(),
-            )
-
-            send(
-                chat_id,
-                "Send the password in your next message.",
-            )
-            return
-
-        _pending_passwords.pop(
-            chat_id,
-            None,
-        )
-
-        if not hmac.compare_digest(
-            password,
-            MASTER_DELETE_PASSWORD,
-        ):
-            send(
-                chat_id,
-                "Password required or invalid password.",
-            )
-            return
-
-        delete_for_master(
-            chat_id,
-            command,
-        )
-        return
-
-    if command == "favorite":
-        if "|" not in argument:
-            send(
-                chat_id,
-                "Usage: /favorite <title> | <url>",
-            )
-            return
-
-        title, url = (
-            part.strip()
-            for part in argument.split("|", 1)
-        )
-
-        if not title or not valid_site(url):
-            send(
-                chat_id,
-                "Provide a title and a valid http(s) URL.",
-            )
-            return
-
-        if supabase_enabled():
-            try:
-                remote_save_favorite(
-                    chat_id,
-                    title,
-                    url,
-                )
-
-            except (
-                HTTPError,
-                URLError,
-                OSError,
-                KeyError,
-                ValueError,
-                RuntimeError,
-            ) as exc:
-                LOGGER.warning(
-                    "Supabase favorite save failed; "
-                    "using local SQLite: %s",
-                    exc,
-                )
-
-                notify_master(
-                    "Supabase unavailable",
-                    "Favorite save failed; "
-                    "local fallback enabled.\n"
-                    f"{exc}",
-                )
-
-                save_local_favorite(
-                    chat_id,
-                    title,
-                    url,
-                )
+    except Exception:
+        logger.exception("execute_search failed for %s", raw_title)
+        msg = "❌ Something went wrong. Please try again."
+        if status:
+            await safe_telegram_call(status.edit_text(msg), "edit status error")
         else:
-            save_local_favorite(
-                chat_id,
-                title,
-                url,
-            )
+            await safe_telegram_call(update.message.reply_text(msg), "send error")
 
-        send(
-            chat_id,
-            "Saved to favorites.",
-        )
+
+async def search_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
         return
+    raw = update.message.text.strip()
+    if raw:
+        await execute_search(update, context, raw)
 
-    if command in {"favorites", "history"}:
-        if supabase_enabled():
-            try:
-                rows = (
-                    remote_list_favorites(chat_id)
-                    if command == "favorites"
-                    else remote_list_history(chat_id)
-                )
 
-            except (
-                HTTPError,
-                URLError,
-                OSError,
-                KeyError,
-                ValueError,
-                RuntimeError,
-            ) as exc:
-                LOGGER.warning(
-                    "Supabase %s read failed; "
-                    "using local SQLite: %s",
-                    command,
-                    exc,
-                )
-
-                notify_master(
-                    "Supabase unavailable",
-                    f"{command} read failed; "
-                    f"local fallback enabled.\n{exc}",
-                )
-
-                rows = (
-                    local_list_favorites(chat_id)
-                    if command == "favorites"
-                    else local_list_history(chat_id)
-                )
-        else:
-            rows = (
-                local_list_favorites(chat_id)
-                if command == "favorites"
-                else local_list_history(chat_id)
-            )
-
-        if command == "favorites":
-            reply = (
-                "\n".join(
-                    f"{escape(title)}\n{url}"
-                    for title, url in rows
-                )
-                or "No favorites yet."
-            )
-        else:
-            reply = (
-                "\n".join(
-                    f"{escape(category)}: "
-                    f"{escape(title)}"
-                    for title, category in rows
-                )
-                or "No search history yet."
-            )
-
-        send(
-            chat_id,
-            reply,
-        )
+async def _category_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    category: str,
+    usage: str,
+) -> None:
+    if not update.message:
         return
-
-    category = (
-        category_command(command)
-        if command in {
-            "movie",
-            "tv",
-            "anime",
-            "game",
-        }
-        else "movie"
-    )
-
-    title = (
-        argument.strip()
-        if command in {
-            "movie",
-            "tv",
-            "anime",
-            "game",
-        }
-        else text
-    )
-
-    if not title:
-        send(
-            chat_id,
-            f"Usage: /{category} <title>",
-        )
+    query = get_command_query(context)
+    if not query:
+        await update.message.reply_text(f"Usage: {usage}")
         return
+    await execute_search(update, context, query, forced_category=category)
 
-    send(
-        chat_id,
-        f"Searching for {title}...",
-    )
+
+async def movie_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _category_command(update, context, CATEGORY_MOVIE, "/movie <title>")
+
+async def tv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _category_command(update, context, CATEGORY_TV, "/tv <title>")
+
+async def anime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _category_command(update, context, CATEGORY_ANIME, "/anime <title>")
+
+async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _category_command(update, context, CATEGORY_GAME, "/game <title>")
+
+
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    rows = await asyncio.to_thread(get_favorites, update.message.from_user.id)
+    if not rows:
+        await update.message.reply_text("❌ No favorites saved.")
+        return
+    for row in rows:
+        title = row[0]
+        token = build_title_token(title) or ""
+        if token:
+            store_token(context, "favorite_tokens", token, title)
+        keyboard = [[
+            InlineKeyboardButton(
+                "❌ Remove",
+                callback_data=f"remove:{token}" if token else "remove",
+            )
+        ]]
+        await update.message.reply_text(
+            f"⭐ {title}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    rows = await asyncio.to_thread(get_history, update.message.from_user.id)
+    if not rows:
+        await update.message.reply_text("❌ No history found.")
+        return
+    text = "🕘 Search History:\n\n" + "".join(f"• {r[0]}\n" for r in rows)
+    await update.message.reply_text(text)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Callback handler
+# ════════════════════════════════════════════════════════════════════════════
+
+async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    data = (query.data or "").strip()
+    if not data:
+        await safe_telegram_call(query.answer("Invalid action."), "callback empty")
+        return
 
     try:
-        results = search(
-            title,
-            category,
-        )
-
-        if supabase_enabled():
-            try:
-                remote_add_history(
-                    chat_id,
-                    title,
-                    category,
+        # ── Add to favorites ─────────────────────────────────────────────────
+        if data.startswith("fav:") or data == "fav":
+            token = data[4:] if data.startswith("fav:") else context.user_data.get("current_title_token", "")
+            title = (get_token_value(context, "title_tokens", token) if token else None) \
+                    or context.user_data.get("current_title", "")
+            if not title:
+                await safe_telegram_call(
+                    query.answer("Search expired — please search again.", show_alert=True),
+                    "fav expired",
                 )
-
-            except (
-                HTTPError,
-                URLError,
-                OSError,
-                KeyError,
-                ValueError,
-                RuntimeError,
-            ) as exc:
-                LOGGER.warning(
-                    "Supabase history write failed; "
-                    "using local SQLite: %s",
-                    exc,
-                )
-
-                notify_master(
-                    "Supabase unavailable",
-                    "History write failed; "
-                    "local fallback enabled.\n"
-                    f"{exc}",
-                )
-
-                save_local_history(
-                    chat_id,
-                    title,
-                    category,
-                )
-        else:
-            save_local_history(
-                chat_id,
-                title,
-                category,
+                return
+            await asyncio.to_thread(add_favorite, query.from_user.id, title)
+            await safe_telegram_call(
+                query.answer("Added to favorites ⭐", show_alert=False),
+                "fav add",
             )
 
-        if results:
-            send(
-                chat_id,
-                "\n\n".join(
-                    f"{escape(label)}\n{url}"
-                    for url, label in results
+        # ── Pagination ────────────────────────────────────────────────────────
+        elif data in ("next", "prev"):
+            await safe_telegram_call(query.answer(), "pagination")
+            cat = context.user_data.get("current_category", CATEGORY_MOVIE)
+            results = get_results_for_category(context, cat)
+            all_results = list(results.items())
+            if not all_results:
+                await safe_telegram_call(query.answer("No results to paginate."), "page empty")
+                return
+            page = get_category_page(context, cat)
+            page += 1 if data == "next" else -1
+            max_page = max(0, (len(all_results) - 1) // RESULTS_PER_PAGE)
+            page = max(0, min(page, max_page))
+            set_category_page(context, cat, page)
+            context.user_data["results"] = all_results
+            show_guide = (
+                cat == CATEGORY_TV
+                and context.user_data.get("current_is_tv")
+                and context.user_data.get("current_seasons")
+            )
+            kb = build_main_keyboard(
+                all_results, context.user_data.get("current_title", ""),
+                page=page, show_episode_guide=bool(show_guide),
+                active_category=cat,
+                title_token=context.user_data.get("current_title_token"),
+            )
+            await safe_telegram_call(
+                query.edit_message_reply_markup(InlineKeyboardMarkup(kb)),
+                "pagination edit",
+            )
+
+        # ── Category switch ───────────────────────────────────────────────────
+        elif data.startswith("cat:"):
+            await safe_telegram_call(query.answer(), "cat switch")
+            category = data[4:].strip()
+            if category not in SEARCH_CATEGORIES:
+                await safe_telegram_call(query.answer("Invalid category."), "cat invalid")
+                return
+
+            cat_store = context.user_data.setdefault("category_results", {})
+
+            # BUG FIX: use sentinel None to distinguish "not yet searched" from
+            # "searched and found nothing" (empty dict).  An empty dict means we
+            # already know there are no results — do not search again.
+            if category not in cat_store:
+                title = context.user_data.get("current_title", "")
+                if not title:
+                    await safe_telegram_call(
+                        query.answer("Search expired — please search again.", show_alert=True),
+                        "cat expired",
+                    )
+                    return
+
+                cat_cache_keys = context.user_data.setdefault("category_cache_keys", {})
+                cache_key = cat_cache_keys.get(category) or make_cache_key(
+                    get_category_cache_prefix(category), title
+                )
+                if cache_key:
+                    cat_cache_keys[category] = cache_key
+
+                cached = await asyncio.to_thread(get_cached, cache_key) if cache_key else None
+                if cached is not None:
+                    new_results = resolve_cached_category_results(cached)
+                else:
+                    new_results = await asyncio.to_thread(search_category_sites, title, category)
+                    if cache_key:
+                        await asyncio.to_thread(
+                            save_cache, cache_key, new_results or CACHE_EMPTY_MARKER
+                        )
+
+                # Store result (even empty) so we don't re-search on next click
+                cat_store[category] = new_results
+
+                if not new_results:
+                    # BUG FIX: return after toast so we don't fall through to
+                    # set_active_category with empty data
+                    await safe_telegram_call(
+                        query.answer("No results found in this category", show_alert=False),
+                        "cat no results",
+                    )
+                    return
+
+            set_active_category(context, category)
+            current_title = context.user_data.get("current_title", "")
+            all_results   = context.user_data.get("results", [])
+            page          = get_category_page(context, category)
+            show_guide = (
+                category == CATEGORY_TV
+                and context.user_data.get("current_is_tv")
+                and context.user_data.get("current_seasons")
+            )
+            kb = build_main_keyboard(
+                all_results, current_title,
+                page=page, show_episode_guide=bool(show_guide),
+                active_category=category,
+                title_token=context.user_data.get("current_title_token"),
+            )
+            caption = context.user_data.get("main_caption", "")
+            if not all_results:
+                caption += f"\n\n❌ No results for {category_display_label(category)}."
+            await safe_telegram_call(
+                query.edit_message_text(
+                    caption, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    disable_web_page_preview=True,
                 ),
+                "cat switch edit",
             )
+
+        # ── Remove favorite ───────────────────────────────────────────────────
+        elif data.startswith("remove:"):
+            token = data[7:]
+            # BUG FIX: only use token as title if it's a valid lookup; never
+            # use a raw hash digest as a DB value.
+            title = get_token_value(context, "favorite_tokens", token) if token else None
+            if not title:
+                await safe_telegram_call(
+                    query.answer("Favorite expired — open /favorites to refresh.", show_alert=True),
+                    "remove expired",
+                )
+                return
+            await asyncio.to_thread(remove_favorite, query.from_user.id, title)
+            await safe_telegram_call(
+                query.edit_message_text(f"❌ Removed:\n{title}"),
+                "remove fav",
+            )
+
+        # ── Back to main ─────────────────────────────────────────────────────
+        elif data == "back:main":
+            await safe_telegram_call(query.answer(), "back:main")
+            cat = context.user_data.get("current_category", CATEGORY_MOVIE)
+            set_active_category(context, cat)
+            all_results = context.user_data.get("results", [])
+            caption = context.user_data.get(
+                "main_caption",
+                f'🎬 <b>Results for "{context.user_data.get("current_title", "")}"</b>'
+                "\n\n🔗 Select a source below:",
+            )
+            show_guide = (
+                cat == CATEGORY_TV
+                and context.user_data.get("current_is_tv")
+                and context.user_data.get("current_seasons")
+            )
+            if not all_results:
+                caption += f"\n\n❌ No results for {category_display_label(cat)}."
+            kb = build_main_keyboard(
+                all_results, context.user_data.get("current_title", ""),
+                page=get_category_page(context, cat),
+                show_episode_guide=bool(show_guide),
+                active_category=cat,
+                title_token=context.user_data.get("current_title_token"),
+            )
+            await safe_telegram_call(
+                query.edit_message_text(
+                    caption, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    disable_web_page_preview=True,
+                ),
+                "back:main edit",
+            )
+
+        # ── Episode guide ─────────────────────────────────────────────────────
+        elif data == "guide:episodes":
+            seasons = context.user_data.get("current_seasons", [])
+            if not seasons:
+                await safe_telegram_call(query.answer("No season guide available."), "guide empty")
+                return
+            await safe_telegram_call(query.answer(), "guide episodes")
+            await safe_telegram_call(
+                query.edit_message_text(
+                    text=format_episode_guide_text(
+                        context.user_data.get("current_title", ""), seasons
+                    ),
+                    reply_markup=build_episode_guide_keyboard(seasons),
+                ),
+                "guide edit",
+            )
+
+        # ── Season selection ──────────────────────────────────────────────────
+        elif data.startswith("season:"):
+            number = data[7:].strip()
+            await safe_telegram_call(
+                query.answer(f"Selected Season {number}"), "season select"
+            )
+
+        # ── OTT lookup ────────────────────────────────────────────────────────
+        elif data.startswith("ott:") or data == "ott":
+            await safe_telegram_call(query.answer(), "ott")
+            token = data[4:] if data.startswith("ott:") else context.user_data.get("current_title_token", "")
+            title = (get_token_value(context, "title_tokens", token) if token else None) \
+                    or context.user_data.get("current_title", "")
+            if not title:
+                await safe_telegram_call(
+                    query.answer("Search expired — please search again.", show_alert=True),
+                    "ott expired",
+                )
+                return
+
+            norm = normalize_title(title)
+            ott_cache = context.user_data.setdefault("ott_results", {})
+            ott_data = ott_cache.get(norm)
+
+            if ott_data is None:
+                cache_key = make_cache_key(CACHE_PREFIX_OTT, title)
+                cached = await asyncio.to_thread(get_cached, cache_key) if cache_key else None
+                if cached is not None:
+                    ott_data = cached
+                else:
+                    tmdb_info = (
+                        context.user_data.get("current_tmdb_info")
+                        if context.user_data.get("current_title_key") == norm
+                        else None
+                    )
+                    ott_data = await asyncio.to_thread(search_ott, title, tmdb_info)
+                    if cache_key:
+                        await asyncio.to_thread(save_cache, cache_key, ott_data)
+                ott_cache[norm] = ott_data
+
+            if not isinstance(ott_data, dict):
+                ott_data = {}
+
+            await safe_telegram_call(
+                query.edit_message_text(
+                    text=format_ott_text(title, ott_data),
+                    reply_markup=build_ott_keyboard(ott_data),
+                ),
+                "ott edit",
+            )
+
         else:
-            send(
-                chat_id,
-                "No matching links found. "
-                "Try a different title.",
-            )
+            logger.warning("Unknown callback: %s", data)
+            await safe_telegram_call(query.answer("Invalid action."), "unknown cb")
 
-    except (
-        HTTPError,
-        URLError,
-        RuntimeError,
-        sqlite3.Error,
-    ) as exc:
-        LOGGER.warning(
-            "Request failed for chat %s: %s",
-            chat_id,
-            exc,
-        )
-
-        send(
-            chat_id,
-            "The search service is temporarily "
-            "unavailable. Please try again.",
+    except Exception:
+        logger.exception("favorite_callback failed for data=%s", data)
+        await safe_telegram_call(
+            query.answer("❌ Something went wrong.", show_alert=False),
+            "callback error",
         )
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8",
-        )
-        self.end_headers()
-        self.wfile.write(b"ok\n")
+# ════════════════════════════════════════════════════════════════════════════
+# Background jobs
+# ════════════════════════════════════════════════════════════════════════════
 
-    def log_message(self, *_args: object) -> None:
-        return
-
-
-def start_health_server() -> None:
+async def cleanup_cache_job(_: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic cache cleanup driven by JobQueue (preferred path)."""
     try:
-        port = int(
-            os.getenv("PORT", "8080")
-        )
+        removed = await asyncio.to_thread(cleanup_cache)
+        if removed:
+            logger.info("Cache cleanup: removed %d expired entries", removed)
+    except Exception:
+        logger.exception("Cache cleanup job failed")
 
-        if not 1 <= port <= 65535:
-            raise ValueError
 
-        server = ThreadingHTTPServer(
-            ("0.0.0.0", port),
-            HealthHandler,
-        )
+def _fallback_cleanup_loop() -> None:
+    """
+    Background daemon thread used when python-telegram-bot[job-queue] is not
+    installed.  Runs cleanup_cache() every CACHE_CLEANUP_INTERVAL seconds.
+    The thread is daemonised so it never prevents process exit.
+    """
+    logger.info(
+        "Fallback cache-cleanup thread started (interval=%ds)", CACHE_CLEANUP_INTERVAL
+    )
+    while True:
+        time.sleep(CACHE_CLEANUP_INTERVAL)
+        try:
+            removed = cleanup_cache()
+            if removed:
+                logger.info(
+                    "Fallback cleanup: removed %d expired cache entries", removed
+                )
+        except Exception:
+            logger.exception("Fallback cleanup iteration failed")
 
-        LOGGER.info(
-            "Health server listening on port %d",
-            port,
-        )
 
-        server.serve_forever()
+def start_fallback_cleanup_thread() -> None:
+    """Start the daemon cleanup thread exactly once."""
+    global _cleanup_thread
+    if _cleanup_thread is not None and _cleanup_thread.is_alive():
+        return
+    _cleanup_thread = threading.Thread(
+        target=_fallback_cleanup_loop,
+        name="cache-cleanup",
+        daemon=True,
+    )
+    _cleanup_thread.start()
 
-    except (OSError, ValueError) as exc:
-        LOGGER.warning(
-            "Health server disabled: %s",
-            exc,
-        )
 
+# ════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     logging.basicConfig(
-        level=os.getenv(
-            "LOG_LEVEL",
-            "INFO",
-        ).upper(),
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        ),
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
+    logger.info("✅ Bot starting up...")
+    logger.info("BOT_TOKEN present:    %s", bool(BOT_TOKEN))
+    logger.info("TMDB_API_KEY present: %s", bool(TMDB_API_KEY))
+    logger.info("Working directory:    %s", os.getcwd())
+    logger.info("Bot script location:  %s", _BASE_DIR)
+    logger.info("DB file:              %s", DB_FILE)
+    logger.info("sites.json path:      %s", SITES_FILE)
+    logger.info("sites.json exists:    %s", os.path.isfile(SITES_FILE))
 
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is missing from .env "
-            "or the environment"
+        raise ValueError("BOT_TOKEN is missing from environment / .env")
+    if not TMDB_API_KEY:
+        raise ValueError("TMDB_API_KEY is missing from environment / .env")
+
+    init_db()
+    removed = cleanup_cache()
+    if removed:
+        logger.info("Startup cache cleanup: removed %d stale entries", removed)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("help",      help_command))
+    app.add_handler(CommandHandler("sites",     sites_command))
+    app.add_handler(CommandHandler("movie",     movie_command))
+    app.add_handler(CommandHandler("tv",        tv_command))
+    app.add_handler(CommandHandler("anime",     anime_command))
+    app.add_handler(CommandHandler("game",      game_command))
+    app.add_handler(CommandHandler("favorites", favorites_command))
+    app.add_handler(CommandHandler("history",   history_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_title))
+    app.add_handler(CallbackQueryHandler(favorite_callback))
+
+    # ── JobQueue is optional (needs python-telegram-bot[job-queue]) ──────────
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            cleanup_cache_job,
+            interval=CACHE_CLEANUP_INTERVAL,
+            first=CACHE_CLEANUP_INTERVAL,
         )
+        logger.info("JobQueue cache-cleanup scheduled every %ds", CACHE_CLEANUP_INTERVAL)
+    else:
+        logger.warning(
+            "JobQueue not available (install python-telegram-bot[job-queue] for "
+            "scheduled cleanup). Falling back to daemon thread."
+        )
+        start_fallback_cleanup_thread()
 
-    if not supabase_enabled():
-        db().close()
-
-    threading.Thread(
-        target=start_health_server,
-        daemon=True,
-        name="health",
-    ).start()
-
-    telegram(
-        "setMyCommands",
-        scope={"type": "default"},
-        commands=public_commands(),
-    )
-
-    telegram(
-        "setMyCommands",
-        scope={
-            "type": "chat",
-            "chat_id": MASTER_CHAT_ID,
-        },
-        commands=master_commands(),
-    )
-
-    if first_start_needed():
-        try:
-            send(
-                MASTER_CHAT_ID,
-                "Welcome, Master. The bot is ready "
-                "for its first use.\n"
-                "Use /masterstatus to view bot health. "
-                "Restricted controls require the password "
-                "every time.",
-                master_keyboard(),
-            )
-
-            mark_first_start_complete()
-
-        except (
-            HTTPError,
-            URLError,
-            RuntimeError,
-        ) as exc:
-            LOGGER.warning(
-                "Could not send first-start greeting "
-                "to master: %s",
-                exc,
-            )
-
-    LOGGER.info(
-        "Bot is running with %d configured sites",
-        sum(map(len, SITES.values())),
-    )
-
-    offset = 0
-
-    while True:
-        try:
-            updates = telegram(
-                "getUpdates",
-                offset=offset,
-                timeout=45,
-                allowed_updates=["message"],
-            )
-
-            for update in updates or []:
-                offset = update["update_id"] + 1
-                handle_message(
-                    update.get("message", {})
-                )
-
-        except (
-            HTTPError,
-            URLError,
-            TimeoutError,
-            RuntimeError,
-            json.JSONDecodeError,
-        ) as exc:
-            LOGGER.warning(
-                "Polling failed: %s; retrying",
-                exc,
-            )
-
-            notify_master(
-                "Bot polling fault",
-                str(exc),
-            )
-
-            time.sleep(5)
+    logger.info("Bot is polling...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
-        LOGGER.exception(
-            "Fatal bot error"
-        )
-        notify_master(
-            "Bot stopped",
-            str(exc),
-        )
+    except Exception:
+        import traceback
+        print("❌ Startup error:")
+        traceback.print_exc()
         raise
