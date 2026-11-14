@@ -1,2 +1,8 @@
-# The bot uses only Python's standard library.
-# This keeps installation small and works on Raspberry Pi OS.
+python-telegram-bot[job-queue]==22.1
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+python-dotenv==1.0.1
+yt-dlp==2024.3.10
+ddgs
+supabase
