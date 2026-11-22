@@ -1718,7 +1718,10 @@ def main() -> None:
         start_fallback_cleanup_thread()
 
     logger.info("Bot is polling...")
-    app.run_polling(drop_pending_updates=True)
+    threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    ).start()
 
 
 if __name__ == "__main__":
