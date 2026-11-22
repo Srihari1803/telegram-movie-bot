@@ -30,6 +30,7 @@ CACHE_TTL = 3600
 MAX_SEARCH_SITES = 12
 MAX_SEARCH_BATCHES = 3
 MAX_RESULTS = 5
+SEARCH_TIMEOUT = 30
 PASSWORD_PROMPT_TTL = 120
 MASTER_CHAT_ID = 5589716681
 
@@ -563,12 +564,16 @@ def search(
 
     sites = SITES.get(category, [])
     results: list[tuple[str, str]] = []
+    search_deadline = time.monotonic() + SEARCH_TIMEOUT
 
     for batch_start in range(
         0,
         len(sites),
         MAX_SEARCH_SITES,
     ):
+        if time.monotonic() >= search_deadline:
+            break
+
         if (
             batch_start // MAX_SEARCH_SITES
             >= MAX_SEARCH_BATCHES
@@ -580,23 +585,31 @@ def search(
             batch_start + MAX_SEARCH_SITES
         ]
 
-        with ThreadPoolExecutor(
+        pool = ThreadPoolExecutor(
             max_workers=min(
                 4,
                 max(1, len(batch)),
             )
-        ) as pool:
-            futures = [
-                pool.submit(
-                    search_site,
-                    site,
-                    title,
-                    category,
-                )
-                for site in batch
-            ]
+        )
+        futures = [
+            pool.submit(
+                search_site,
+                site,
+                title,
+                category,
+            )
+            for site in batch
+        ]
 
-            for future in as_completed(futures):
+        try:
+            remaining = max(
+                0.1,
+                search_deadline - time.monotonic(),
+            )
+            for future in as_completed(
+                futures,
+                timeout=remaining,
+            ):
                 try:
                     results.extend(
                         future.result()
@@ -609,6 +622,16 @@ def search(
 
                 if len(results) >= MAX_RESULTS:
                     break
+        except TimeoutError:
+            LOGGER.debug(
+                "Search stopped after %s seconds",
+                SEARCH_TIMEOUT,
+            )
+        finally:
+            pool.shutdown(
+                wait=False,
+                cancel_futures=True,
+            )
 
         if len(results) >= MAX_RESULTS:
             break
@@ -1101,11 +1124,23 @@ def main() -> None:
         name="health",
     ).start()
 
-    telegram(
-        "setMyCommands",
-        scope={"type": "default"},
-        commands=public_commands(),
-    )
+    try:
+        telegram(
+            "setMyCommands",
+            scope={"type": "default"},
+            commands=public_commands(),
+        )
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        RuntimeError,
+        json.JSONDecodeError,
+    ) as exc:
+        LOGGER.warning(
+            "Could not publish Telegram commands: %s",
+            exc,
+        )
 
     offset = 0
 
@@ -1119,10 +1154,31 @@ def main() -> None:
             )
 
             for update in updates or []:
-                offset = update["update_id"] + 1
-                handle_message(
-                    update.get("message", {})
-                )
+                update_id = update["update_id"]
+                try:
+                    handle_message(
+                        update.get("message", {})
+                    )
+                except Exception as exc:
+                    LOGGER.exception(
+                        "Failed to handle update %s",
+                        update_id,
+                    )
+                    message = update.get("message", {})
+                    chat_id = message.get("chat", {}).get("id")
+                    if isinstance(chat_id, int):
+                        try:
+                            send(
+                                chat_id,
+                                "The bot encountered an error. "
+                                "Please try again.",
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "Could not send update failure reply",
+                            )
+                finally:
+                    offset = update_id + 1
 
         except (
             HTTPError,
