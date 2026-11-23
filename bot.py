@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
@@ -29,7 +30,7 @@ REQUEST_TIMEOUT = 12
 CACHE_TTL = 3600
 MAX_SEARCH_SITES = 12
 MAX_SEARCH_BATCHES = 3
-MAX_RESULTS = 5
+MAX_RESULTS = 10
 SEARCH_TIMEOUT = 30
 PASSWORD_PROMPT_TTL = 120
 MASTER_CHAT_ID = 5589716681
@@ -533,7 +534,7 @@ def search_site(
                 )
 
         if results:
-            return results[:2]
+            break
 
     direct_search_urls = (
         f"{site.rstrip('/')}/search?q={title_query}",
@@ -581,9 +582,77 @@ def search_site(
                 )
 
         if results:
-            return results[:2]
+            break
 
-    return []
+    title_lower = title.lower().strip()
+    title_tokens = {
+        token
+        for token in title_lower.replace("-", " ").replace("_", " ").split()
+        if len(token) >= 2
+    }
+
+    def result_rank(
+        candidate: tuple[str, str],
+    ) -> tuple[int, float, str]:
+        url, label = candidate
+        url_lower = url.lower()
+        label_lower = label.lower()
+        combined = f"{label_lower} {url_lower}"
+
+        if any(
+            marker in url_lower
+            for marker in (
+                "/search",
+                "?s=",
+                "?q=",
+                "search?",
+                "/search?",
+            )
+        ):
+            return (-100, 0.0, url)
+
+        title_similarity = SequenceMatcher(
+            None,
+            title_lower,
+            label_lower,
+        ).ratio()
+        url_similarity = SequenceMatcher(
+            None,
+            title_lower,
+            url_lower,
+        ).ratio()
+        matched_tokens = sum(
+            token in combined
+            for token in title_tokens
+        )
+
+        score = (
+            matched_tokens * 20
+            + int(title_similarity * 30)
+            + int(url_similarity * 20)
+        )
+        if title_lower in label_lower:
+            score += 50
+        if title_lower.replace(" ", "-") in url_lower:
+            score += 50
+
+        return (
+            score,
+            max(title_similarity, url_similarity),
+            url,
+        )
+
+    ranked = sorted(
+        results,
+        key=result_rank,
+        reverse=True,
+    )
+    exact = [
+        candidate
+        for candidate in ranked
+        if result_rank(candidate)[0] >= 0
+    ]
+    return exact[:3]
 
 
 def search(
@@ -596,7 +665,21 @@ def search(
         try:
             cached = remote_cache_get(key)
             if cached is not None:
-                return cached
+                usable = [
+                    item
+                    for item in cached
+                    if not any(
+                        marker in item[0].lower()
+                        for marker in (
+                            "/search",
+                            "?s=",
+                            "?q=",
+                            "search?",
+                        )
+                    )
+                ]
+                if usable:
+                    return usable[:MAX_RESULTS]
         except Exception as exc:
             LOGGER.warning(
                 "Supabase cache read failed: %s",
@@ -616,9 +699,22 @@ def search(
             tuple(item)
             for item in json.loads(row[0])
         ]
+        cached = [
+            item
+            for item in cached
+            if not any(
+                marker in item[0].lower()
+                for marker in (
+                    "/search",
+                    "?s=",
+                    "?q=",
+                    "search?",
+                )
+            )
+        ]
         if cached:
             connection.close()
-            return cached
+            return cached[:MAX_RESULTS]
 
     sites = SITES.get(category, [])
     results: list[tuple[str, str]] = []
