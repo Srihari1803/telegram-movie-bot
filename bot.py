@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -585,9 +586,9 @@ def search_site(
             break
 
     title_lower = canonical_title(title).lower().strip()
-    title_tokens = {
+    search_tokens = {
         token
-        for token in title_lower.replace("-", " ").replace("_", " ").split()
+        for token in title_tokens(title)
         if len(token) >= 2
     }
 
@@ -623,7 +624,7 @@ def search_site(
         ).ratio()
         matched_tokens = sum(
             token in combined
-            for token in title_tokens
+            for token in search_tokens
         )
 
         score = (
@@ -948,6 +949,13 @@ def canonical_title(title: str) -> str:
     return replacements.get(normalized, title.strip())
 
 
+def title_tokens(title: str) -> list[str]:
+    return re.findall(
+        r"[a-z0-9]+",
+        canonical_title(title).lower(),
+    )
+
+
 def slugify_url_title(url: str) -> str:
     path = urlparse(url).path.lower().strip("/")
     if not path:
@@ -1012,7 +1020,7 @@ def relevant_result(
 
     tokens = [
         token
-        for token in title_lower.replace("-", " ").replace("_", " ").split()
+        for token in title_tokens(title)
         if len(token) >= 3
     ]
     if not tokens:
