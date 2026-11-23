@@ -549,7 +549,6 @@ def search_site(
         f"{site.rstrip('/')}/movies/{slug}",
         f"{site.rstrip('/')}/watch/{slug}",
         f"{site.rstrip('/')}/tv/{slug}",
-        f"{site.rstrip('/')}/{slug}",
     )
 
     for search_url in direct_search_urls:
@@ -987,7 +986,7 @@ def relevant_result(
     label: str,
 ) -> bool:
     title_lower = canonical_title(title).lower().strip()
-    combined = f"{label} {url}".lower()
+    label_lower = label.lower().strip()
 
     if any(
         marker in url.lower()
@@ -1006,33 +1005,46 @@ def relevant_result(
     normalized_title = title_lower.replace(" ", "-")
     normalized_slug = slugify_url_title(url)
 
-    if normalized_slug and (
+    title_slug_tokens = title_tokens(title)
+    significant_title_tokens = [
+        token for token in title_slug_tokens
+        if len(token) >= 3
+    ]
+
+    url_slug_match = bool(normalized_slug) and (
         SequenceMatcher(
             None,
             title_lower,
             normalized_slug,
-        ).ratio() >= 0.58
+        ).ratio() >= 0.72
         or title_lower in normalized_slug
         or normalized_title in url.lower()
+    )
+    if url_slug_match:
+        return True
+
+    title_in_label = title_lower in label_lower
+    if title_in_label and (
+        normalized_title in url.lower()
+        or normalized_slug and title_lower in normalized_slug
     ):
         return True
 
-    if title_lower in combined:
-        return True
-
-    tokens = [
-        token
-        for token in title_tokens(title)
-        if len(token) >= 3
-    ]
-    if not tokens:
+    if not significant_title_tokens:
         return False
 
-    matched = sum(
-        token in combined
-        for token in tokens
+    matched_in_label = sum(
+        token in label_lower
+        for token in significant_title_tokens
     )
-    return matched == len(tokens)
+    matched_in_url = sum(
+        token in url.lower()
+        for token in significant_title_tokens
+    )
+    return (
+        matched_in_label == len(significant_title_tokens)
+        and matched_in_url == len(significant_title_tokens)
+    )
 
 
 class HealthHandler(BaseHTTPRequestHandler):
