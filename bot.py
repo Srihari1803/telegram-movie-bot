@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import html
 import hmac
 import json
@@ -389,8 +391,13 @@ class LinkParser(HTMLParser):
         tag: str,
         attrs: list[tuple[str, str | None]],
     ) -> None:
-        if tag.lower() == "a":
-            self.current_href = dict(attrs).get("href") or ""
+        tag_name = tag.lower()
+        if tag_name in {"a", "link"}:
+            attributes = dict(attrs)
+            self.current_href = (
+                attributes.get("href")
+                or ("__text__" if tag_name == "link" else "")
+            )
             self.current_text = []
 
     def handle_data(self, data: str) -> None:
@@ -398,12 +405,17 @@ class LinkParser(HTMLParser):
             self.current_text.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "a" and self.current_href:
+        if tag.lower() in {"a", "link"} and self.current_href:
             text = " ".join(
                 "".join(self.current_text).split()
             )
+            href = (
+                text
+                if self.current_href == "__text__"
+                else self.current_href
+            )
             self.links.append(
-                (self.current_href, text)
+                (href, text)
             )
             self.current_href = ""
 
@@ -458,7 +470,26 @@ def unwrap_redirect(url: str) -> str:
             parsed.query
         ).get("u", [])
         if redirect:
-            return redirect[0]
+            value = redirect[0]
+            if value.startswith("a1"):
+                encoded = value[2:]
+                try:
+                    padding = "=" * (
+                        -len(encoded) % 4
+                    )
+                    decoded = base64.urlsafe_b64decode(
+                        encoded + padding
+                    ).decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                    if decoded.startswith(
+                        ("http://", "https://")
+                    ):
+                        return decoded
+                except (ValueError, binascii.Error):
+                    pass
+            return value
 
     if host in {"google.com", "www.google.com"}:
         redirect = parse_qs(
