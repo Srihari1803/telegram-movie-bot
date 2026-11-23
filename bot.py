@@ -488,10 +488,13 @@ def search_site(
     search_urls = (
         f"https://html.duckduckgo.com/html/?q={query}",
         f"https://lite.duckduckgo.com/lite/?q={query}",
+        f"https://www.bing.com/search?format=rss&q={query}",
         f"https://www.bing.com/search?q={query}",
         f"https://search.brave.com/search?q={query}",
         f"https://search.yahoo.com/search?p={query}",
         f"https://www.google.com/search?q={query}",
+        f"https://www.ecosia.org/search?q={query}",
+        f"https://www.mojeek.com/search?q={query}",
     )
 
     results: list[tuple[str, str]] = []
@@ -542,6 +545,11 @@ def search_site(
         f"{site.rstrip('/')}/search/{slug}",
         f"{site.rstrip('/')}/search/{title_query}",
         f"{site.rstrip('/')}/?s={title_query}",
+        f"{site.rstrip('/')}/movie/{slug}",
+        f"{site.rstrip('/')}/movies/{slug}",
+        f"{site.rstrip('/')}/watch/{slug}",
+        f"{site.rstrip('/')}/tv/{slug}",
+        f"{site.rstrip('/')}/{slug}",
     )
 
     for search_url in direct_search_urls:
@@ -651,13 +659,10 @@ def search_site(
     exact = [
         candidate
         for candidate in ranked
-        if (
-            result_rank(candidate)[0] >= 40
-            and relevant_result(
-                title,
-                candidate[0],
-                candidate[1],
-            )
+        if relevant_result(
+            title,
+            candidate[0],
+            candidate[1],
         )
     ]
     return exact[:3]
@@ -983,7 +988,6 @@ def relevant_result(
 ) -> bool:
     title_lower = canonical_title(title).lower().strip()
     combined = f"{label} {url}".lower()
-    label_lower = label.lower().strip()
 
     if any(
         marker in url.lower()
@@ -1014,8 +1018,6 @@ def relevant_result(
         return True
 
     if title_lower in combined:
-        if label_lower == title_lower:
-            return False
         return True
 
     tokens = [
