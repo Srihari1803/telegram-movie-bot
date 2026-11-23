@@ -544,6 +544,8 @@ def search_site(
         f"{site.rstrip('/')}/search?q={title_query}",
         f"{site.rstrip('/')}/search/{slug}",
         f"{site.rstrip('/')}/search/{title_query}",
+        f"{site.rstrip('/')}/search?query={title_query}",
+        f"{site.rstrip('/')}/?q={title_query}",
         f"{site.rstrip('/')}/?s={title_query}",
         f"{site.rstrip('/')}/movie/{slug}",
         f"{site.rstrip('/')}/movies/{slug}",
@@ -987,6 +989,8 @@ def relevant_result(
 ) -> bool:
     title_lower = canonical_title(title).lower().strip()
     label_lower = label.lower().strip()
+    title_normalized = re.sub(r"[^a-z0-9]+", " ", title_lower).strip()
+    title_slug = title_normalized.replace(" ", "-")
 
     if any(
         marker in url.lower()
@@ -1002,7 +1006,8 @@ def relevant_result(
     ):
         return False
 
-    normalized_title = title_lower.replace(" ", "-")
+    normalized_title = title_slug
+    url_lower = url.lower()
     normalized_slug = slugify_url_title(url)
 
     title_slug_tokens = title_tokens(title)
@@ -1014,19 +1019,21 @@ def relevant_result(
     url_slug_match = bool(normalized_slug) and (
         SequenceMatcher(
             None,
-            title_lower,
+            title_normalized,
             normalized_slug,
         ).ratio() >= 0.72
-        or title_lower in normalized_slug
-        or normalized_title in url.lower()
+        or title_normalized in normalized_slug
+        or normalized_title in url_lower
     )
     if url_slug_match:
         return True
 
-    title_in_label = title_lower in label_lower
-    if title_in_label and (
-        normalized_title in url.lower()
-        or normalized_slug and title_lower in normalized_slug
+    normalized_label = re.sub(r"[^a-z0-9]+", " ", label_lower).strip()
+    if (
+        title_normalized in normalized_label
+        and normalized_slug
+        and len(normalized_slug) > len(title_normalized)
+        and title_normalized in normalized_slug
     ):
         return True
 
