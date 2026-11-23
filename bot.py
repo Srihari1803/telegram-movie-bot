@@ -517,8 +517,6 @@ def search_site(
     )
 
     search_urls = (
-        f"https://html.duckduckgo.com/html/?q={query}",
-        f"https://lite.duckduckgo.com/lite/?q={query}",
         f"https://www.bing.com/search?format=rss&q={query}",
         f"https://www.bing.com/search?q={query}",
         f"https://search.brave.com/search?q={query}",
@@ -526,6 +524,8 @@ def search_site(
         f"https://www.google.com/search?q={query}",
         f"https://www.ecosia.org/search?q={query}",
         f"https://www.mojeek.com/search?q={query}",
+        f"https://html.duckduckgo.com/html/?q={query}",
+        f"https://lite.duckduckgo.com/lite/?q={query}",
     )
 
     results: list[tuple[str, str]] = []
