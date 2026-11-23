@@ -584,7 +584,7 @@ def search_site(
         if results:
             break
 
-    title_lower = title.lower().strip()
+    title_lower = canonical_title(title).lower().strip()
     title_tokens = {
         token
         for token in title_lower.replace("-", " ").replace("_", " ").split()
@@ -666,6 +666,7 @@ def search(
     title: str,
     category: str,
 ) -> list[tuple[str, str]]:
+    title = canonical_title(title)
     key = f"{category}:{title.lower().strip()}"
 
     if supabase_enabled():
@@ -931,13 +932,50 @@ def escape(text: str) -> str:
     return html.escape(text, quote=False)
 
 
+def canonical_title(title: str) -> str:
+    normalized = " ".join(
+        title.lower()
+        .replace("-", " ")
+        .replace("_", " ")
+        .split()
+    )
+
+    replacements = {
+        "vampire daires": "vampire diaries",
+        "vampire dairy": "vampire diaries",
+        "vampire dairies": "vampire diaries",
+    }
+    return replacements.get(normalized, title.strip())
+
+
+def slugify_url_title(url: str) -> str:
+    path = urlparse(url).path.lower().strip("/")
+    if not path:
+        return ""
+
+    segments = [
+        segment
+        for segment in path.split("/")
+        if segment
+    ]
+    slug = segments[-1]
+    slug = "".join(
+        char
+        if char.isalnum()
+        else " "
+        for char in slug
+    )
+    return " ".join(slug.split())
+
+
 def relevant_result(
     title: str,
     url: str,
     label: str,
 ) -> bool:
-    title_lower = title.lower().strip()
+    title_lower = canonical_title(title).lower().strip()
     combined = f"{label} {url}".lower()
+    label_lower = label.lower().strip()
 
     if any(
         marker in url.lower()
@@ -953,11 +991,23 @@ def relevant_result(
     ):
         return False
 
-    if title_lower in combined:
+    normalized_title = title_lower.replace(" ", "-")
+    normalized_slug = slugify_url_title(url)
+
+    if normalized_slug and (
+        SequenceMatcher(
+            None,
+            title_lower,
+            normalized_slug,
+        ).ratio() >= 0.58
+        or title_lower in normalized_slug
+        or normalized_title in url.lower()
+    ):
         return True
 
-    slug = title_lower.replace(" ", "-")
-    if slug in url.lower():
+    if title_lower in combined:
+        if label_lower == title_lower:
+            return False
         return True
 
     tokens = [
