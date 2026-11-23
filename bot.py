@@ -458,6 +458,13 @@ def unwrap_redirect(url: str) -> str:
         if redirect:
             return redirect[0]
 
+    if host in {"google.com", "www.google.com"}:
+        redirect = parse_qs(
+            parsed.query
+        ).get("q", [])
+        if redirect:
+            return redirect[0]
+
     return url
 
 
@@ -480,6 +487,7 @@ def search_site(
         f"https://www.bing.com/search?q={query}",
         f"https://search.brave.com/search?q={query}",
         f"https://search.yahoo.com/search?p={query}",
+        f"https://www.google.com/search?q={query}",
     )
 
     results: list[tuple[str, str]] = []
@@ -870,6 +878,12 @@ def handle_message(message: dict) -> None:
 
     if not isinstance(chat_id, int) or not text:
         return
+
+    LOGGER.info(
+        "Received message from %s: %s",
+        chat_id,
+        text[:200],
+    )
 
     command, _, argument = text.partition(" ")
     command = command.lstrip("/").split("@", 1)[0].lower()
