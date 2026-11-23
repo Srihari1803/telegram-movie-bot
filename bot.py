@@ -549,14 +549,18 @@ def search_site(
         f"{site.rstrip('/')}/?s={title_query}",
         f"{site.rstrip('/')}/movie/{slug}",
         f"{site.rstrip('/')}/movies/{slug}",
+        f"{site.rstrip('/')}/film/{slug}",
         f"{site.rstrip('/')}/watch/{slug}",
         f"{site.rstrip('/')}/tv/{slug}",
+        f"{site.rstrip('/')}/title/{slug}",
+        f"{site.rstrip('/')}/catalog/{slug}",
     )
 
     for search_url in direct_search_urls:
         try:
             parser = LinkParser()
-            parser.feed(fetch(search_url))
+            page_body = fetch(search_url)
+            parser.feed(page_body)
         except (
             HTTPError,
             URLError,
@@ -590,6 +594,27 @@ def search_site(
                 results.append(
                     (absolute, label[:120])
                 )
+
+        title_normalized = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            canonical_title(title).lower(),
+        ).strip()
+        page_text = page_body.lower()
+        url_slug = slugify_url_title(search_url)
+        if (
+            "/search" not in search_url.lower()
+            and "?s=" not in search_url.lower()
+            and "?q=" not in search_url.lower()
+            and title_normalized in page_text
+            and title_normalized in url_slug
+            and search_url not in {
+                url for url, _ in results
+            }
+        ):
+            results.append(
+                (search_url, canonical_title(title))
+            )
 
         if results:
             break
