@@ -476,6 +476,8 @@ def search_site(
     del category
 
     domain = normalise_domain(site)
+    slug = quote_plus(title.lower().strip().replace(" ", "-"))
+    title_query = quote_plus(title)
 
     query = quote_plus(
         f'site:{domain} "{title}"'
@@ -520,6 +522,54 @@ def search_site(
                 continue
 
             if normalise_domain(absolute) != domain:
+                continue
+
+            label = text or title
+            if absolute not in {
+                url for url, _ in results
+            }:
+                results.append(
+                    (absolute, label[:120])
+                )
+
+        if results:
+            return results[:2]
+
+    direct_search_urls = (
+        f"{site.rstrip('/')}/search?q={title_query}",
+        f"{site.rstrip('/')}/search/{slug}",
+        f"{site.rstrip('/')}/search/{title_query}",
+        f"{site.rstrip('/')}/?s={title_query}",
+    )
+
+    for search_url in direct_search_urls:
+        try:
+            parser = LinkParser()
+            parser.feed(fetch(search_url))
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            ValueError,
+        ) as exc:
+            LOGGER.debug(
+                "Direct search failed for %s: %s",
+                domain,
+                exc,
+            )
+            continue
+
+        for href, text in parser.links:
+            absolute = urljoin(search_url, href)
+            if not absolute.startswith(
+                ("http://", "https://")
+            ):
+                continue
+
+            if normalise_domain(absolute) != domain:
+                continue
+
+            if absolute.rstrip("/") == site.rstrip("/"):
                 continue
 
             label = text or title
