@@ -650,7 +650,14 @@ def search_site(
     exact = [
         candidate
         for candidate in ranked
-        if result_rank(candidate)[0] >= 0
+        if (
+            result_rank(candidate)[0] >= 40
+            and relevant_result(
+                title,
+                candidate[0],
+                candidate[1],
+            )
+        )
     ]
     return exact[:3]
 
@@ -668,15 +675,7 @@ def search(
                 usable = [
                     item
                     for item in cached
-                    if not any(
-                        marker in item[0].lower()
-                        for marker in (
-                            "/search",
-                            "?s=",
-                            "?q=",
-                            "search?",
-                        )
-                    )
+                    if relevant_result(title, item[0], item[1])
                 ]
                 if usable:
                     return usable[:MAX_RESULTS]
@@ -702,15 +701,7 @@ def search(
         cached = [
             item
             for item in cached
-            if not any(
-                marker in item[0].lower()
-                for marker in (
-                    "/search",
-                    "?s=",
-                    "?q=",
-                    "search?",
-                )
-            )
+        if relevant_result(title, item[0], item[1])
         ]
         if cached:
             connection.close()
@@ -877,8 +868,111 @@ def send(
     )
 
 
+def result_page_markup(
+    chat_id: int,
+    page: int,
+    page_count: int,
+) -> dict:
+    del chat_id
+    buttons: list[dict] = []
+    if page > 0:
+        buttons.append(
+            {
+                "text": "Previous",
+                "callback_data": f"results:{page - 1}",
+            }
+        )
+    if page + 1 < page_count:
+        buttons.append(
+            {
+                "text": "Next",
+                "callback_data": f"results:{page + 1}",
+            }
+        )
+    return {
+        "inline_keyboard": [buttons]
+    } if buttons else {}
+
+
+def send_result_page(
+    chat_id: int,
+    results: list[tuple[str, str]],
+    page: int,
+) -> None:
+    page_size = 5
+    page_count = (
+        len(results) + page_size - 1
+    ) // page_size
+    page = max(0, min(page, page_count - 1))
+    start = page * page_size
+    current = results[start:start + page_size]
+
+    text = "\n\n".join(
+        f"{escape(label)}\n{url}"
+        for url, label in current
+    )
+    text += (
+        f"\n\nPage {page + 1}/{page_count}"
+    )
+
+    markup = result_page_markup(
+        chat_id,
+        page,
+        page_count,
+    )
+    send(
+        chat_id,
+        text,
+        markup if markup else None,
+    )
+
+
 def escape(text: str) -> str:
     return html.escape(text, quote=False)
+
+
+def relevant_result(
+    title: str,
+    url: str,
+    label: str,
+) -> bool:
+    title_lower = title.lower().strip()
+    combined = f"{label} {url}".lower()
+
+    if any(
+        marker in url.lower()
+        for marker in (
+            "/search",
+            "?s=",
+            "?q=",
+            "search?",
+            "/category/",
+            "/categories/",
+            "/genres/",
+        )
+    ):
+        return False
+
+    if title_lower in combined:
+        return True
+
+    slug = title_lower.replace(" ", "-")
+    if slug in url.lower():
+        return True
+
+    tokens = [
+        token
+        for token in title_lower.replace("-", " ").replace("_", " ").split()
+        if len(token) >= 3
+    ]
+    if not tokens:
+        return False
+
+    matched = sum(
+        token in combined
+        for token in tokens
+    )
+    return matched == len(tokens)
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -925,6 +1019,10 @@ def start_health_server() -> None:
 _pending_passwords: dict[
     int,
     tuple[str, float],
+] = {}
+_search_pages: dict[
+    int,
+    tuple[list[tuple[str, str]], int],
 ] = {}
 
 
@@ -1231,12 +1329,14 @@ def handle_message(message: dict) -> None:
         )
 
         if results:
-            send(
+            _search_pages[chat_id] = (
+                results,
+                0,
+            )
+            send_result_page(
                 chat_id,
-                "\n\n".join(
-                    f"{escape(label)}\n{url}"
-                    for url, label in results
-                ),
+                results,
+                0,
             )
         else:
             send(
@@ -1255,6 +1355,94 @@ def handle_message(message: dict) -> None:
             "The search service is temporarily "
             "unavailable.",
         )
+
+
+def handle_callback_query(
+    callback_query: dict,
+) -> None:
+    callback_id = callback_query.get("id")
+    data = callback_query.get("data") or ""
+    message = callback_query.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+
+    if not isinstance(chat_id, int):
+        return
+
+    if callback_id:
+        try:
+            telegram(
+                "answerCallbackQuery",
+                callback_query_id=callback_id,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not answer callback query: %s",
+                exc,
+            )
+
+    if not data.startswith("results:"):
+        return
+
+    try:
+        page = int(data.split(":", 1)[1])
+    except ValueError:
+        return
+
+    state = _search_pages.get(chat_id)
+    if not state:
+        send(chat_id, "Search results expired.")
+        return
+
+    results, _old_page = state
+    page_size = 5
+    page_count = (
+        len(results) + page_size - 1
+    ) // page_size
+    page = max(0, min(page, page_count - 1))
+    _search_pages[chat_id] = (
+        results,
+        page,
+    )
+
+    message_id = message.get("message_id")
+    if isinstance(message_id, int):
+        start = page * page_size
+        current = results[start:start + page_size]
+        text = "\n\n".join(
+            f"{escape(label)}\n{url}"
+            for url, label in current
+        )
+        text += (
+            f"\n\nPage {page + 1}/{page_count}"
+        )
+        markup = result_page_markup(
+            chat_id,
+            page,
+            page_count,
+        )
+        try:
+            telegram(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                disable_web_page_preview=True,
+                reply_markup=(
+                    markup if markup else None
+                ),
+            )
+            return
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not edit result page: %s",
+                exc,
+            )
+
+    send_result_page(
+        chat_id,
+        results,
+        page,
+    )
 
 
 def main() -> None:
@@ -1310,15 +1498,23 @@ def main() -> None:
                 "getUpdates",
                 offset=offset,
                 timeout=45,
-                allowed_updates=["message"],
+                allowed_updates=[
+                    "message",
+                    "callback_query",
+                ],
             )
 
             for update in updates or []:
                 update_id = update["update_id"]
                 try:
-                    handle_message(
-                        update.get("message", {})
-                    )
+                    if "callback_query" in update:
+                        handle_callback_query(
+                            update["callback_query"]
+                        )
+                    else:
+                        handle_message(
+                            update.get("message", {})
+                        )
                 except Exception as exc:
                     LOGGER.exception(
                         "Failed to handle update %s",
